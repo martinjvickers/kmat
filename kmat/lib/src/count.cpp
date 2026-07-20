@@ -26,23 +26,19 @@ Error count_kmers_to_presence_set(const CountOptions& opts) {
     return Error::invalid_argument("min_count (--ci) must be >= 1");
   }
 
-  std::vector<FastaRecord> records;
-  if (auto err = read_sequence_file(opts.input_path, records); !err.ok()) {
-    return err;
-  }
-
   std::unordered_map<std::uint64_t, std::uint32_t> counts;
-  counts.reserve(1 << 16);
-  for (const FastaRecord& rec : records) {
-    if (auto err = for_each_encoded_kmer(rec.sequence, opts.kmer_size, [&](std::uint64_t code) {
+  counts.reserve(1 << 20);
+
+  if (auto err = for_each_sequence(opts.input_path, [&](const std::string& sequence) -> Error {
+        return for_each_encoded_kmer(sequence, opts.kmer_size, [&](std::uint64_t code) {
           auto& c = counts[code];
           if (c < std::numeric_limits<std::uint32_t>::max()) {
             ++c;
           }
         });
-        !err.ok()) {
-      return err;
-    }
+      });
+      !err.ok()) {
+    return err;
   }
 
   PresenceSet set;

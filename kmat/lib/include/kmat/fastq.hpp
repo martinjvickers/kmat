@@ -3,6 +3,7 @@
 #include "kmat/error.hpp"
 #include "kmat/fasta.hpp"
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -14,7 +15,12 @@ struct FastqRecord {
   std::string quality;
 };
 
-/// Read all records from a FASTQ file (plain or .gz).
+/// Stream FASTQ/FASTA records (plain or .gz). Does not load the whole file into RAM.
+/// Callback receives one sequence at a time (id may be empty for some paths).
+Error for_each_sequence(const std::string& path,
+                        const std::function<Error(const std::string& sequence)>& fn);
+
+/// Read all records from a FASTQ file (plain or .gz). Prefer for_each_sequence for large files.
 Error read_fastq_sequences(const std::string& path, std::vector<FastqRecord>& records);
 
 /// Load DNA sequences from FASTA/FASTQ, optionally gzip-compressed (by extension).

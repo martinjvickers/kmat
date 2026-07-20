@@ -2,9 +2,9 @@
 
 #include "kmat/fasta.hpp"
 
-#include <algorithm>
 #include <cctype>
 #include <fstream>
+#include <functional>
 #include <string>
 #include <vector>
 #include <zlib.h>
@@ -29,145 +29,186 @@ bool ends_with_ci(const std::string& path, const std::string& suffix) {
   return p.compare(p.size() - s.size(), s.size(), s) == 0;
 }
 
-Error read_all_bytes_plain(const std::string& path, std::string& out) {
-  std::ifstream in(path, std::ios::binary);
-  if (!in) {
-    return Error::io_error("failed to open file: " + path);
+void strip_cr(std::string& line) {
+  if (!line.empty() && line.back() == '\r') {
+    line.pop_back();
   }
-  out.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
-  return Error::success();
 }
 
-Error read_all_bytes_gzip(const std::string& path, std::string& out) {
-  gzFile gz = gzopen(path.c_str(), "rb");
-  if (gz == nullptr) {
-    return Error::io_error("failed to open gzip file: " + path);
-  }
-
-  out.clear();
-  char buf[1 << 16];
-  while (true) {
-    const int n = gzread(gz, buf, sizeof(buf));
-    if (n < 0) {
-      gzclose(gz);
-      return Error::io_error("gzip read failed: " + path);
-    }
-    if (n == 0) {
-      break;
-    }
-    out.append(buf, static_cast<std::size_t>(n));
-  }
-  gzclose(gz);
-  return Error::success();
-}
-
-Error read_all_bytes(const std::string& path, std::string& out) {
-  if (path_looks_gzip(path)) {
-    return read_all_bytes_gzip(path, out);
-  }
-  return read_all_bytes_plain(path, out);
-}
-
-std::vector<std::string> split_lines(const std::string& text) {
-  std::vector<std::string> lines;
-  std::string cur;
-  for (char c : text) {
-    if (c == '\n') {
-      if (!cur.empty() && cur.back() == '\r') {
-        cur.pop_back();
+class LineReader {
+ public:
+  explicit LineReader(const std::string& path) : path_(path), gzip_(ends_with_ci(path, ".gz")) {
+    if (gzip_) {
+      gz_ = gzopen(path.c_str(), "rb");
+      if (gz_ != nullptr) {
+        gzbuffer(gz_, 1 << 20);
       }
-      lines.push_back(cur);
-      cur.clear();
     } else {
-      cur.push_back(c);
+      plain_.open(path);
     }
   }
-  if (!cur.empty()) {
-    if (cur.back() == '\r') {
-      cur.pop_back();
+
+  ~LineReader() {
+    if (gz_ != nullptr) {
+      gzclose(gz_);
+      gz_ = nullptr;
     }
-    lines.push_back(cur);
   }
-  return lines;
-}
 
-Error parse_fastq_text(const std::string& text, const std::string& path,
-                       std::vector<FastqRecord>& records) {
-  const std::vector<std::string> lines = split_lines(text);
-  records.clear();
+  LineReader(const LineReader&) = delete;
+  LineReader& operator=(const LineReader&) = delete;
 
-  for (std::size_t i = 0; i < lines.size();) {
-    while (i < lines.size() && lines[i].empty()) {
-      ++i;
-    }
-    if (i >= lines.size()) {
-      break;
-    }
-    if (lines[i].empty() || lines[i].front() != '@') {
-      return Error::invalid_argument("FASTQ expected '@' header in " + path);
-    }
-    if (i + 3 >= lines.size()) {
-      return Error::invalid_argument("truncated FASTQ record in " + path);
+  bool ok_open() const { return gzip_ ? (gz_ != nullptr) : static_cast<bool>(plain_); }
+
+  Error getline(std::string& line) {
+    line.clear();
+    if (gzip_) {
+      for (;;) {
+        const int ch = gzgetc(gz_);
+        if (ch < 0) {
+          int err = Z_OK;
+          const char* msg = gzerror(gz_, &err);
+          if (gzeof(gz_) || err == Z_OK || err == Z_STREAM_END) {
+            eof_ = true;
+            strip_cr(line);
+            return Error::success();
+          }
+          return Error::io_error(std::string("gzip read failed: ") + path_ + " (" +
+                                 (msg != nullptr ? msg : "unknown") + ")");
+        }
+        if (ch == '\n') {
+          strip_cr(line);
+          return Error::success();
+        }
+        line.push_back(static_cast<char>(ch));
+      }
     }
 
-    FastqRecord rec;
-    rec.id = lines[i].substr(1);
-    rec.sequence = lines[i + 1];
-    // lines[i + 2] is '+' separator (optional id)
-    rec.quality = lines[i + 3];
-    if (rec.sequence.size() != rec.quality.size()) {
-      return Error::invalid_argument("FASTQ sequence/quality length mismatch in " + path);
+    if (!std::getline(plain_, line)) {
+      eof_ = true;
+      line.clear();
+      if (plain_.bad()) {
+        return Error::io_error("failed reading file: " + path_);
+      }
+      return Error::success();
     }
-    if (auto err = normalize_dna(rec.sequence); !err.ok()) {
+    strip_cr(line);
+    return Error::success();
+  }
+
+  bool eof() const { return eof_; }
+
+ private:
+  std::string path_;
+  bool gzip_{false};
+  bool eof_{false};
+  gzFile gz_{nullptr};
+  std::ifstream plain_;
+};
+
+Error for_each_fastq_sequence(LineReader& in, const std::string& path,
+                              const std::function<Error(const std::string&)>& fn) {
+  std::string header;
+  std::string seq;
+  std::string plus;
+  std::string qual;
+  std::size_t nrec = 0;
+
+  for (;;) {
+    if (auto err = in.getline(header); !err.ok()) {
       return err;
     }
-    records.push_back(std::move(rec));
-    i += 4;
+    while (!in.eof() && header.empty()) {
+      if (auto err = in.getline(header); !err.ok()) {
+        return err;
+      }
+    }
+    if (header.empty()) {
+      break;
+    }
+    if (header.front() != '@') {
+      return Error::invalid_argument("FASTQ expected '@' header in " + path);
+    }
+
+    if (auto err = in.getline(seq); !err.ok()) {
+      return err;
+    }
+    if (in.eof() && seq.empty()) {
+      return Error::invalid_argument("truncated FASTQ record in " + path);
+    }
+    if (auto err = in.getline(plus); !err.ok()) {
+      return err;
+    }
+    if (auto err = in.getline(qual); !err.ok()) {
+      return err;
+    }
+    if (seq.size() != qual.size()) {
+      return Error::invalid_argument("FASTQ sequence/quality length mismatch in " + path);
+    }
+    if (auto err = normalize_dna(seq); !err.ok()) {
+      return err;
+    }
+    if (auto err = fn(seq); !err.ok()) {
+      return err;
+    }
+    ++nrec;
   }
 
-  if (records.empty()) {
+  if (nrec == 0) {
     return Error::invalid_argument("no sequences found in FASTQ: " + path);
   }
   return Error::success();
 }
 
-Error parse_fasta_text(const std::string& text, const std::string& path,
-                       std::vector<FastaRecord>& records) {
-  const std::vector<std::string> lines = split_lines(text);
-  records.clear();
-  FastaRecord current;
-  bool have_record = false;
+Error for_each_fasta_sequence(LineReader& in, const std::string& path,
+                              const std::function<Error(const std::string&)>& fn) {
+  std::string line;
+  std::string seq;
+  bool have = false;
+  std::size_t nrec = 0;
 
-  for (const std::string& line : lines) {
+  auto flush = [&]() -> Error {
+    if (!have) {
+      return Error::success();
+    }
+    if (auto err = normalize_dna(seq); !err.ok()) {
+      return err;
+    }
+    if (auto err = fn(seq); !err.ok()) {
+      return err;
+    }
+    ++nrec;
+    seq.clear();
+    have = false;
+    return Error::success();
+  };
+
+  for (;;) {
+    if (auto err = in.getline(line); !err.ok()) {
+      return err;
+    }
+    if (in.eof() && line.empty()) {
+      break;
+    }
     if (line.empty()) {
       continue;
     }
     if (line.front() == '>') {
-      if (have_record) {
-        if (auto err = normalize_dna(current.sequence); !err.ok()) {
-          return err;
-        }
-        records.push_back(std::move(current));
-        current = FastaRecord{};
+      if (auto err = flush(); !err.ok()) {
+        return err;
       }
-      current.id = line.substr(1);
-      have_record = true;
+      have = true;
       continue;
     }
-    if (!have_record) {
+    if (!have) {
       return Error::invalid_argument("FASTA sequence before header in " + path);
     }
-    current.sequence += line;
+    seq += line;
   }
-
-  if (have_record) {
-    if (auto err = normalize_dna(current.sequence); !err.ok()) {
-      return err;
-    }
-    records.push_back(std::move(current));
+  if (auto err = flush(); !err.ok()) {
+    return err;
   }
-
-  if (records.empty()) {
+  if (nrec == 0) {
     return Error::invalid_argument("no sequences found in FASTA: " + path);
   }
   return Error::success();
@@ -190,42 +231,82 @@ bool path_looks_fasta(const std::string& path) {
          ends_with_ci(path, ".fna.gz");
 }
 
-Error read_fastq_sequences(const std::string& path, std::vector<FastqRecord>& records) {
-  std::string text;
-  if (auto err = read_all_bytes(path, text); !err.ok()) {
-    return err;
+Error for_each_sequence(const std::string& path,
+                        const std::function<Error(const std::string& sequence)>& fn) {
+  LineReader in(path);
+  if (!in.ok_open()) {
+    return Error::io_error("failed to open file: " + path);
   }
-  return parse_fastq_text(text, path, records);
+  if (path_looks_fastq(path)) {
+    return for_each_fastq_sequence(in, path, fn);
+  }
+  return for_each_fasta_sequence(in, path, fn);
+}
+
+Error read_fastq_sequences(const std::string& path, std::vector<FastqRecord>& records) {
+  records.clear();
+  // Re-stream with ids for API compatibility.
+  LineReader in(path);
+  if (!in.ok_open()) {
+    return Error::io_error("failed to open FASTQ: " + path);
+  }
+
+  std::string header;
+  std::string seq;
+  std::string plus;
+  std::string qual;
+
+  for (;;) {
+    if (auto err = in.getline(header); !err.ok()) {
+      return err;
+    }
+    while (!in.eof() && header.empty()) {
+      if (auto err = in.getline(header); !err.ok()) {
+        return err;
+      }
+    }
+    if (header.empty()) {
+      break;
+    }
+    if (header.front() != '@') {
+      return Error::invalid_argument("FASTQ expected '@' header in " + path);
+    }
+    if (auto err = in.getline(seq); !err.ok()) {
+      return err;
+    }
+    if (auto err = in.getline(plus); !err.ok()) {
+      return err;
+    }
+    if (auto err = in.getline(qual); !err.ok()) {
+      return err;
+    }
+    if (seq.size() != qual.size()) {
+      return Error::invalid_argument("FASTQ sequence/quality length mismatch in " + path);
+    }
+    FastqRecord rec;
+    rec.id = header.size() > 1 ? header.substr(1) : std::string{};
+    rec.sequence = seq;
+    rec.quality = std::move(qual);
+    if (auto err = normalize_dna(rec.sequence); !err.ok()) {
+      return err;
+    }
+    records.push_back(std::move(rec));
+  }
+
+  if (records.empty()) {
+    return Error::invalid_argument("no sequences found in FASTQ: " + path);
+  }
+  return Error::success();
 }
 
 Error read_sequence_file(const std::string& path, std::vector<FastaRecord>& records) {
-  if (path_looks_fastq(path)) {
-    std::vector<FastqRecord> fq;
-    if (auto err = read_fastq_sequences(path, fq); !err.ok()) {
-      return err;
-    }
-    records.clear();
-    records.reserve(fq.size());
-    for (FastqRecord& r : fq) {
-      FastaRecord fr;
-      fr.id = std::move(r.id);
-      fr.sequence = std::move(r.sequence);
-      records.push_back(std::move(fr));
-    }
+  records.clear();
+  return for_each_sequence(path, [&](const std::string& sequence) -> Error {
+    FastaRecord fr;
+    fr.sequence = sequence;
+    records.push_back(std::move(fr));
     return Error::success();
-  }
-
-  // FASTA (plain or gzip) or unknown → try FASTA text parse after optional gunzip.
-  if (path_looks_gzip(path) || path_looks_fasta(path)) {
-    std::string text;
-    if (auto err = read_all_bytes(path, text); !err.ok()) {
-      return err;
-    }
-    return parse_fasta_text(text, path, records);
-  }
-
-  // Default: existing plain FASTA reader.
-  return read_fasta_sequences(path, records);
+  });
 }
 
 }  // namespace kmat
