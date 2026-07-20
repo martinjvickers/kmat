@@ -17,7 +17,7 @@ replacements = [
     ),
     (
         "STATIC_LFLAGS = -static -Wl,--whole-archive -lpthread -Wl,--no-whole-archive",
-        "STATIC_LFLAGS = -static-libgcc -static-libstdc++ -pthread -lz",
+        "STATIC_LFLAGS = -static-libgcc -static-libstdc++ -pthread",
     ),
     ("LIB_ZLIB=3rd_party/cloudflare/libz.a", "LIB_ZLIB="),
     (
@@ -32,9 +32,14 @@ replacements = [
         "kmc_tools: $(KMC_TOOLS_OBJS) $(KMC_API_OBJS) $(KFF_OBJS) $(LIB_ZLIB)",
         "kmc_tools: $(KMC_TOOLS_OBJS) $(KMC_API_OBJS) $(KFF_OBJS)",
     ),
+    # -lz must follow object files (left-to-right link order).
+    (
+        "$(CC) $(CLINK) -o $(OUT_BIN_DIR)/$@ $^",
+        "$(CC) $(CLINK) -o $(OUT_BIN_DIR)/$@ $^ -lz",
+    ),
     (
         "$(CC) $(CLINK) -I 3rd_party/cloudflare -o $(OUT_BIN_DIR)/$@ $^",
-        "$(CC) $(CLINK) -o $(OUT_BIN_DIR)/$@ $^",
+        "$(CC) $(CLINK) -o $(OUT_BIN_DIR)/$@ $^ -lz",
     ),
     (
         "dummy := $(shell git submodule update --init --recursive)",
