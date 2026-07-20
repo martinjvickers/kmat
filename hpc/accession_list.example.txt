@@ -1,0 +1,7 @@
+# Example accession list for ~100 FASTQ.gz files.
+# One absolute (or bind-mounted) path per line. Blank lines and # comments are ignored.
+# Copy this file and replace with your real paths — list order = matrix column order.
+#
+# /project/wheat/fastq/acc_001.fastq.gz
+# /project/wheat/fastq/acc_002.fastq.gz
+# /project/wheat/fastq/acc_003.fastq.gz

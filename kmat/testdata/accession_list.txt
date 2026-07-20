@@ -1,0 +1,7 @@
+# Six-accession toy panel (k=3). Paths are relative to testdata/.
+accessions/sample_a.fasta
+accessions/sample_b.fasta
+accessions/sample_c.fasta
+accessions/sample_d.fasta
+accessions/sample_e.fasta
+accessions/sample_f.fasta

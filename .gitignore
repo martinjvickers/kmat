@@ -1,0 +1,28 @@
+# Build artefacts
+kmat/build/
+build/
+cmake-build-*/
+**/CMakeFiles/
+**/CMakeCache.txt
+**/_deps/
+
+# Editor / OS
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+*.user
+
+# Local HPC outputs / secrets
+*.sif
+*.sif.tmp
+hpc/work/
+hpc/out/
+*.kmat
+*.kset
+!kmat/testdata/**/*.tsv
+
+# Legacy trees (not part of the kmat product repo)
+kmer_search/
+matrix_presetup/

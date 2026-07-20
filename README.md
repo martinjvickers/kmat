@@ -1,0 +1,27 @@
+# kmat (refactor workspace)
+
+Greenfield **kmat** toolkit plus roadmap docs. Legacy `kmer_search/` / `matrix_presetup/` are gitignored reference trees.
+
+| Path | Role |
+|---|---|
+| [`kmat/`](kmat/) | Product source (CLI + lib + tests) |
+| [`hpc/`](hpc/) | Singularity + Slurm helpers for real panels |
+| [`singularity/kmat.def`](singularity/kmat.def) | Container recipe |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Legacy pipeline reference |
+| [`REFACTOR.md`](REFACTOR.md) | Target design + phase tracker |
+
+## Quick start (laptop)
+
+```bash
+cd kmat
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+## HPC
+
+```bash
+singularity build kmat.sif singularity/kmat.def
+# then see hpc/README.md — supply your FASTQ list at runtime
+```
