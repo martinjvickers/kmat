@@ -7,33 +7,22 @@ From: ubuntu:22.04
     Description k-mer presence/absence GWAS toolkit (kmat)
 
 %help
-    Build from the repository root (the directory that contains kmat/):
+    Builds kmat by cloning the public GitHub repo over HTTPS, then compiling
+    with CMake:
+
+      https://github.com/martinjvickers/kmat.git
+
+    Build (needs network for apt, git clone, and CMake FetchContent):
 
       singularity build --fakeroot kmat.sif singularity/kmat.def
 
-    Or on an HPC build node with sudo / singularity pro:
-
-      singularity build kmat.sif singularity/kmat.def
+    Optional build-time env (pass with --env):
+      KMAT_GIT_URL   default https://github.com/martinjvickers/kmat.git
+      KMAT_GIT_REF   branch or tag (default: master)
 
     Run:
 
       singularity exec --bind /path/to/data:/data kmat.sif kmat --help
-
-%setup
-    set -euo pipefail
-    # Paths in %setup are relative to the directory where `singularity build` is run.
-    if [ ! -f "${PWD}/kmat/CMakeLists.txt" ]; then
-        echo "ERROR: run singularity build from the repo root (directory containing kmat/)" >&2
-        echo "  cwd=${PWD}" >&2
-        exit 1
-    fi
-    mkdir -p "${SINGULARITY_ROOTFS}/opt/kmat-src"
-    rsync -a \
-        --exclude 'build/' \
-        --exclude '.git/' \
-        --exclude '*.o' \
-        --exclude '.DS_Store' \
-        "${PWD}/kmat/" "${SINGULARITY_ROOTFS}/opt/kmat-src/"
 
 %post
     set -euo pipefail
@@ -46,17 +35,42 @@ From: ubuntu:22.04
         cmake \
         git \
         pkg-config \
-        rsync \
         zlib1g-dev
     rm -rf /var/lib/apt/lists/*
 
-    cmake -S /opt/kmat-src -B /tmp/kmat-build \
+    KMAT_GIT_URL="${KMAT_GIT_URL:-https://github.com/martinjvickers/kmat.git}"
+    KMAT_GIT_REF="${KMAT_GIT_REF:-master}"
+
+    echo "Cloning ${KMAT_GIT_URL} @ ${KMAT_GIT_REF} ..."
+    rm -rf /opt/kmat-src
+    git clone --depth 1 --branch "${KMAT_GIT_REF}" "${KMAT_GIT_URL}" /opt/kmat-src
+
+    if [ -f /opt/kmat-src/CMakeLists.txt ]; then
+        SRC=/opt/kmat-src
+    elif [ -f /opt/kmat-src/kmat/CMakeLists.txt ]; then
+        SRC=/opt/kmat-src/kmat
+    else
+        echo "ERROR: CMakeLists.txt not found (expected repo root or kmat/)" >&2
+        ls -la /opt/kmat-src >&2 || true
+        exit 1
+    fi
+
+    echo "Building from ${SRC} ..."
+    cmake -S "${SRC}" -B /tmp/kmat-build \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/opt/kmat \
         -DKMAT_BUILD_TESTS=OFF \
         -DKMAT_BUILD_BENCHES=OFF
     cmake --build /tmp/kmat-build -j"$(nproc)"
     cmake --install /tmp/kmat-build
+
+    {
+        echo "url=${KMAT_GIT_URL}"
+        echo "ref=${KMAT_GIT_REF}"
+        echo -n "commit="
+        git -C /opt/kmat-src rev-parse HEAD
+    } > /opt/kmat/BUILD_INFO.txt
+
     rm -rf /tmp/kmat-build /opt/kmat-src
 
 %environment
@@ -70,3 +84,4 @@ From: ubuntu:22.04
     set -e
     command -v kmat
     kmat --help >/dev/null
+    test -f /opt/kmat/BUILD_INFO.txt

@@ -2,20 +2,24 @@
 
 This folder has a Singularity image recipe and Slurm helpers for a **count-then-build** panel (e.g. ~100 `.fastq.gz` accessions).
 
-## 1. Clone and build the image
+## 1. Build the Singularity image (clones GitHub inside the container)
 
-On a machine that can run Singularity/Apptainer (and reach Docker Hub + GitHub for dependencies):
+The recipe clones the public repo `https://github.com/martinjvickers/kmat.git`
+during `%post` (no SSH required). The build host needs network access:
 
 ```bash
-git clone <YOUR_REMOTE_URL> kmat_repo
-cd kmat_repo
-
-# Needs network during %post (apt + CMake FetchContent: CLI11, Eigen)
 singularity build --fakeroot kmat.sif singularity/kmat.def
-# or:  apptainer build kmat.sif singularity/kmat.def
+
+# optional: pin a branch/tag
+# singularity build --fakeroot --env KMAT_GIT_REF=main kmat.sif singularity/kmat.def
 ```
 
-Copy `kmat.sif` to the cluster if you built elsewhere.
+Copy `kmat.sif` to the cluster if you built elsewhere. Inspect provenance:
+
+```bash
+singularity exec kmat.sif cat /opt/kmat/BUILD_INFO.txt
+```
+
 
 ## 2. Prepare an accession list
 

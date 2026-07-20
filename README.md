@@ -22,6 +22,6 @@ ctest --test-dir build --output-on-failure
 ## HPC
 
 ```bash
-singularity build kmat.sif singularity/kmat.def
+singularity build --fakeroot kmat.sif singularity/kmat.def
 # then see hpc/README.md — supply your FASTQ list at runtime
 ```
