@@ -6,14 +6,19 @@
 #include "kmat/runtime.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <limits>
+#include <mutex>
 #include <numeric>
+#include <optional>
 #include <queue>
 #include <sstream>
 #include <string>
@@ -44,10 +49,12 @@ struct PatternKeyHash {
   }
 };
 
-std::size_t hash_words(const std::vector<std::uint64_t>& words) {
-  PatternKey key;
-  key.words = words;
-  return PatternKeyHash{}(key);
+std::size_t code_partition(std::uint64_t code, std::size_t num_partitions) {
+  std::uint64_t x = code + 0x9e3779b97f4a7c15ULL;
+  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+  x = x ^ (x >> 31);
+  return static_cast<std::size_t>(x % num_partitions);
 }
 
 std::string scratch_root(const BuildOptions& opts) {
@@ -65,12 +72,11 @@ std::string scratch_root(const BuildOptions& opts) {
 std::size_t default_memory_bytes() {
   const auto cfg = runtime_config();
   if (cfg.profile == RuntimeProfile::Hpc) {
-    return 64ull << 30;  // 64 GiB
+    return 64ull << 30;
   }
-  return 8ull << 30;  // 8 GiB
+  return 8ull << 30;
 }
 
-/// Raise soft RLIMIT_NOFILE to the hard limit (common on HPC where soft=1024).
 void raise_nofile_soft_to_hard() {
   struct rlimit rl {};
   if (::getrlimit(RLIMIT_NOFILE, &rl) != 0) {
@@ -82,8 +88,6 @@ void raise_nofile_soft_to_hard() {
   }
 }
 
-/// How many files we may hold open for a multiway merge (exclusive of stdin/out/err).
-/// Override with KMAT_BUILD_MAX_OPEN for tests / forced hierarchical merge.
 std::size_t merge_fd_budget() {
   if (const char* e = std::getenv("KMAT_BUILD_MAX_OPEN")) {
     char* end = nullptr;
@@ -106,9 +110,6 @@ std::size_t merge_fd_budget() {
   return nofile - kReserve;
 }
 
-/// Partition count from memory budget. ΣK_i is only an *upper bound* on unique U —
-/// using it makes P larger (safer for RAM), never opens that many FDs (shard writers
-/// open-append-close; map assemble merges in waves if P is large).
 std::size_t choose_partitions(std::size_t n_stripes, std::size_t memory_bytes,
                               std::size_t num_threads, std::size_t batch_rows,
                               std::uint64_t sum_kmers) {
@@ -116,7 +117,6 @@ std::size_t choose_partitions(std::size_t n_stripes, std::size_t memory_bytes,
   const std::size_t record_bytes = sizeof(std::uint64_t) * (1 + n_stripes);
   const std::size_t batch = std::max<std::size_t>(1, batch_rows);
 
-  // Target: expected rows/shard ≈ U/P fit in ~memory/threads (hash table ~2× row bytes).
   const std::size_t budget_per_thread =
       std::max<std::size_t>(1ull << 20, memory_bytes / threads);
   const std::uint64_t u_upper = std::max<std::uint64_t>(1, sum_kmers);
@@ -126,29 +126,125 @@ std::size_t choose_partitions(std::size_t n_stripes, std::size_t memory_bytes,
   std::uint64_t p64 = (u_upper + rows_per_shard - 1) / rows_per_shard;
   p64 = std::max<std::uint64_t>(threads, p64);
 
-  // Cap by aggregate writer buffer budget (P × batch × record), not by FD count.
   const std::size_t buf_budget = std::max<std::size_t>(record_bytes * batch, memory_bytes / 4);
   const std::uint64_t max_p_by_buf =
       std::max<std::uint64_t>(1, buf_budget / (record_bytes * batch));
   p64 = std::min(p64, max_p_by_buf);
 
-  // Absolute ceiling: enough for huge panels; still far below inode/path pain.
-  constexpr std::uint64_t kAbsMaxPartitions = 1ull << 16;  // 65536
+  constexpr std::uint64_t kAbsMaxPartitions = 1ull << 16;
   p64 = std::min(p64, kAbsMaxPartitions);
   p64 = std::max<std::uint64_t>(1, p64);
   return static_cast<std::size_t>(p64);
 }
 
-/// Shrink per-shard flush quantum so P writer buffers stay inside ~memory/4.
-std::size_t effective_batch_rows(std::size_t batch_rows, std::size_t num_partitions,
-                                 std::size_t n_stripes, std::size_t memory_bytes) {
-  const std::size_t record_bytes = sizeof(std::uint64_t) * (1 + n_stripes);
+std::size_t scatter_batch_rows(std::size_t batch_rows, std::size_t num_partitions,
+                               std::size_t num_threads, std::size_t memory_bytes) {
   const std::size_t batch = std::max<std::size_t>(1, batch_rows);
   const std::size_t p = std::max<std::size_t>(1, num_partitions);
-  const std::size_t buf_budget = std::max<std::size_t>(record_bytes, memory_bytes / 4);
-  const std::size_t max_batch = std::max<std::size_t>(1, buf_budget / (p * record_bytes));
+  const std::size_t t = std::max<std::size_t>(1, num_threads);
+  // One worker may buffer T code buckets; keep aggregate under ~1/8 memory.
+  const std::size_t budget = std::max<std::size_t>(8, memory_bytes / 8);
+  const std::size_t max_batch = std::max<std::size_t>(1, budget / (t * p * sizeof(std::uint64_t)));
   return std::min(batch, max_batch);
 }
+
+int progress_log_interval_sec() {
+  if (const char* e = std::getenv("KMAT_BUILD_LOG_EVERY_SEC")) {
+    char* end = nullptr;
+    const long v = std::strtol(e, &end, 10);
+    if (end != e && v >= 1) {
+      return static_cast<int>(v);
+    }
+  }
+  return 30;
+}
+
+std::string format_rate(double rate) {
+  std::ostringstream os;
+  if (rate >= 1e6) {
+    os << std::fixed << std::setprecision(2) << (rate / 1e6) << "e6";
+  } else if (rate >= 1e3) {
+    os << std::fixed << std::setprecision(1) << (rate / 1e3) << "e3";
+  } else {
+    os << std::fixed << std::setprecision(2) << rate;
+  }
+  return os.str();
+}
+
+/// Wall-clock progress logger; safe to call from multiple threads (serialized logs).
+class ProgressTicker {
+ public:
+  explicit ProgressTicker(std::string phase)
+      : phase_(std::move(phase)),
+        interval_sec_(progress_log_interval_sec()),
+        start_(std::chrono::steady_clock::now()),
+        last_log_(start_) {}
+
+  void start_log(const std::string& detail = {}) {
+    std::ostringstream os;
+    os << phase_ << ": start";
+    if (!detail.empty()) {
+      os << " " << detail;
+    }
+    log_info(os.str());
+  }
+
+  /// processed units; total=nullopt → no percent/ETA.
+  void tick(std::uint64_t processed, std::optional<std::uint64_t> total,
+            const std::string& extra = {}) {
+    maybe_log(processed, total, extra, false);
+  }
+
+  void done(std::uint64_t processed, std::optional<std::uint64_t> total,
+            const std::string& extra = {}) {
+    maybe_log(processed, total, extra, true);
+  }
+
+ private:
+  void maybe_log(std::uint64_t processed, std::optional<std::uint64_t> total,
+                 const std::string& extra, bool force) {
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(mu_);
+    const auto since_last =
+        std::chrono::duration_cast<std::chrono::seconds>(now - last_log_).count();
+    if (!force && since_last < interval_sec_) {
+      return;
+    }
+    last_log_ = now;
+    const double elapsed =
+        std::chrono::duration<double>(now - start_).count();
+    const double rate = elapsed > 0.0 ? static_cast<double>(processed) / elapsed : 0.0;
+
+    std::ostringstream os;
+    os << phase_ << ": ";
+    if (total.has_value() && *total > 0) {
+      const double pct = 100.0 * static_cast<double>(processed) / static_cast<double>(*total);
+      os << processed << "/" << *total << " (" << std::fixed << std::setprecision(1) << pct
+         << "%)";
+    } else {
+      os << "processed=" << processed;
+    }
+    os << " elapsed=" << static_cast<std::int64_t>(elapsed) << "s"
+       << " rate=" << format_rate(rate) << "/s";
+    if (total.has_value() && *total > processed && rate > 0.0) {
+      const double eta = static_cast<double>(*total - processed) / rate;
+      os << " eta=" << static_cast<std::int64_t>(eta) << "s";
+    }
+    if (!extra.empty()) {
+      os << " " << extra;
+    }
+    if (force) {
+      os << " done";
+    }
+    log_info(os.str());
+  }
+
+  std::string phase_;
+  int interval_sec_;
+  std::chrono::steady_clock::time_point start_;
+  std::chrono::steady_clock::time_point last_log_;
+  std::mutex mu_;
+};
 
 struct HeapItem {
   std::uint64_t code{0};
@@ -164,25 +260,20 @@ struct HeapCmp {
   }
 };
 
-struct ShardWriter {
+/// Buffered writer of sorted uint64 codes (one scatter bucket).
+struct CodeBucketWriter {
   fs::path path;
-  std::vector<char> buf;
-  std::size_t buffered_rows{0};
-  std::size_t batch_rows{0};
-  std::size_t record_bytes{0};
-  std::uint64_t total_rows{0};
+  std::vector<std::uint64_t> buf;
+  std::size_t batch{0};
   bool created{false};
 
-  Error init(const fs::path& shard_path, std::size_t n_stripes, std::size_t batch) {
-    path = shard_path;
-    record_bytes = sizeof(std::uint64_t) * (1 + n_stripes);
-    batch_rows = std::max<std::size_t>(1, batch);
-    buf.reserve(batch_rows * record_bytes);
+  void init(fs::path p, std::size_t batch_rows) {
+    path = std::move(p);
+    batch = std::max<std::size_t>(1, batch_rows);
+    buf.reserve(batch);
     created = false;
-    return Error::success();
   }
 
-  /// Open-append-write-close: partition count is not limited by FDs.
   Error flush() {
     if (buf.empty()) {
       return Error::success();
@@ -195,28 +286,22 @@ struct ShardWriter {
       out.open(path, std::ios::binary | std::ios::app);
     }
     if (!out) {
-      return Error::io_error("failed to open shard for writing: " + path.string() + " (" +
+      return Error::io_error("failed to open scatter bucket: " + path.string() + " (" +
                              std::strerror(errno) + ")");
     }
-    out.write(buf.data(), static_cast<std::streamsize>(buf.size()));
+    out.write(reinterpret_cast<const char*>(buf.data()),
+              static_cast<std::streamsize>(buf.size() * sizeof(std::uint64_t)));
     if (!out) {
-      return Error::io_error("failed writing shard rows: " + path.string());
+      return Error::io_error("failed writing scatter bucket: " + path.string());
     }
     out.close();
     buf.clear();
-    buffered_rows = 0;
     return Error::success();
   }
 
-  Error write_row(std::uint64_t code, const std::vector<std::uint64_t>& words) {
-    const std::size_t off = buf.size();
-    buf.resize(off + record_bytes);
-    std::memcpy(buf.data() + off, &code, sizeof(code));
-    std::memcpy(buf.data() + off + sizeof(code), words.data(),
-                words.size() * sizeof(std::uint64_t));
-    ++buffered_rows;
-    ++total_rows;
-    if (buffered_rows >= batch_rows) {
+  Error push(std::uint64_t code) {
+    buf.push_back(code);
+    if (buf.size() >= batch) {
       return flush();
     }
     return Error::success();
@@ -225,7 +310,40 @@ struct ShardWriter {
   Error close() { return flush(); }
 };
 
-/// Sorted stream of (code, stripe-words) rows — used for hierarchical merge spills.
+struct CodeCursor {
+  std::ifstream in;
+  std::uint64_t code{0};
+  bool has{false};
+  std::size_t acc{0};
+
+  Error open(const fs::path& path, std::size_t accession) {
+    acc = accession;
+    has = false;
+    std::error_code ec;
+    if (!fs::exists(path, ec) || fs::file_size(path, ec) == 0) {
+      return Error::success();
+    }
+    in.open(path, std::ios::binary);
+    if (!in) {
+      return Error::io_error("failed to open scatter bucket: " + path.string());
+    }
+    return advance();
+  }
+
+  Error advance() {
+    has = false;
+    in.read(reinterpret_cast<char*>(&code), sizeof(code));
+    if (in.eof() && in.gcount() == 0) {
+      return Error::success();
+    }
+    if (!in || static_cast<std::size_t>(in.gcount()) != sizeof(code)) {
+      return Error::io_error("corrupt scatter bucket");
+    }
+    has = true;
+    return Error::success();
+  }
+};
+
 struct RowCursor {
   std::ifstream in;
   std::size_t n_stripes{0};
@@ -238,6 +356,11 @@ struct RowCursor {
     n_stripes = stripes;
     record_bytes = sizeof(std::uint64_t) * (1 + n_stripes);
     words.assign(n_stripes, 0);
+    has = false;
+    std::error_code ec;
+    if (!fs::exists(path, ec) || fs::file_size(path, ec) == 0) {
+      return Error::success();
+    }
     in.open(path, std::ios::binary);
     if (!in) {
       return Error::io_error("failed to open merge spill: " + path.string());
@@ -272,7 +395,6 @@ Error write_row_file(std::ofstream& out, std::uint64_t code, const std::vector<s
   return Error::success();
 }
 
-/// Multiway-merge sorted row streams; OR stripe words for equal codes; invoke on_row.
 template <typename Fn>
 Error merge_row_cursors(std::vector<RowCursor>& cursors, Fn&& on_row) {
   std::priority_queue<HeapItem, std::vector<HeapItem>, HeapCmp> heap;
@@ -309,29 +431,25 @@ Error merge_row_cursors(std::vector<RowCursor>& cursors, Fn&& on_row) {
   return Error::success();
 }
 
-/// Merge a subset of .kset files into one sorted (code, words) spill.
-Error merge_ksets_to_spill(const std::vector<std::string>& paths,
-                           const std::vector<std::size_t>& acc_indices, std::size_t n_stripes,
-                           const fs::path& out_path) {
-  std::vector<PresenceSetCursor> cursors(paths.size());
+Error merge_codes_to_row_spill(const std::vector<fs::path>& paths,
+                               const std::vector<std::size_t>& acc_indices, std::size_t n_stripes,
+                               const fs::path& out_path) {
+  std::vector<CodeCursor> cursors(paths.size());
   for (std::size_t i = 0; i < paths.size(); ++i) {
-    if (auto err = cursors[i].open(paths[i]); !err.ok()) {
+    if (auto err = cursors[i].open(paths[i], acc_indices[i]); !err.ok()) {
       return err;
     }
   }
-
   std::ofstream out(out_path, std::ios::binary | std::ios::trunc);
   if (!out) {
-    return Error::io_error("failed to create merge spill: " + out_path.string());
+    return Error::io_error("failed to create code merge spill: " + out_path.string());
   }
-
   std::priority_queue<HeapItem, std::vector<HeapItem>, HeapCmp> heap;
   for (std::size_t i = 0; i < cursors.size(); ++i) {
-    if (cursors[i].has_value()) {
-      heap.push(HeapItem{cursors[i].value(), i});
+    if (cursors[i].has) {
+      heap.push(HeapItem{cursors[i].code, i});
     }
   }
-
   std::vector<std::uint64_t> words(n_stripes, 0);
   while (!heap.empty()) {
     const std::uint64_t code = heap.top().code;
@@ -339,28 +457,22 @@ Error merge_ksets_to_spill(const std::vector<std::string>& paths,
     while (!heap.empty() && heap.top().code == code) {
       const HeapItem item = heap.top();
       heap.pop();
-      const std::size_t acc = acc_indices[item.src];
-      const std::size_t stripe = acc / kAccessionsPerStripe;
-      const std::size_t bit = acc % kAccessionsPerStripe;
-      words[stripe] |= (1ULL << bit);
+      const std::size_t acc = cursors[item.src].acc;
+      words[acc / kAccessionsPerStripe] |= (1ULL << (acc % kAccessionsPerStripe));
       if (auto err = cursors[item.src].advance(); !err.ok()) {
         return err;
       }
-      if (cursors[item.src].has_value()) {
-        heap.push(HeapItem{cursors[item.src].value(), item.src});
+      if (cursors[item.src].has) {
+        heap.push(HeapItem{cursors[item.src].code, item.src});
       }
     }
     if (auto err = write_row_file(out, code, words); !err.ok()) {
       return err;
     }
   }
-  for (auto& c : cursors) {
-    c.close();
-  }
   return Error::success();
 }
 
-/// Reduce many sorted row spills until count ≤ fd_budget, then return paths.
 Error reduce_row_spills(std::vector<fs::path>& spills, std::size_t n_stripes, std::size_t fd_budget,
                         const fs::path& work, int& spill_seq) {
   const std::size_t group = std::max<std::size_t>(2, fd_budget);
@@ -397,83 +509,149 @@ Error reduce_row_spills(std::vector<fs::path>& spills, std::size_t n_stripes, st
   return Error::success();
 }
 
-Error process_shard(const fs::path& shard_path, const fs::path& pat_path, const fs::path& map_path,
-                    std::size_t n_stripes, std::size_t batch_rows, std::uint64_t& out_patterns,
-                    std::uint64_t& out_kmers) {
-  const std::size_t record_bytes = sizeof(std::uint64_t) * (1 + n_stripes);
-  std::ifstream in(shard_path, std::ios::binary);
-  if (!in) {
-    return Error::io_error("failed to open shard: " + shard_path.string());
+Error emit_pattern_row(std::ofstream& pat, std::ofstream& map,
+                       std::unordered_map<PatternKey, std::uint32_t, PatternKeyHash>& dedup,
+                       std::uint64_t code, const std::vector<std::uint64_t>& words,
+                       std::size_t n_stripes) {
+  PatternKey key;
+  key.words = words;
+  std::uint32_t pid = 0;
+  const auto it = dedup.find(key);
+  if (it == dedup.end()) {
+    if (dedup.size() >= std::numeric_limits<std::uint32_t>::max()) {
+      return Error::invalid_argument(
+          "pattern count exceeds uint32 in one shard; raise --memory-gb or use more partitions");
+    }
+    pid = static_cast<std::uint32_t>(dedup.size());
+    dedup.emplace(std::move(key), pid);
+    pat.write(reinterpret_cast<const char*>(words.data()),
+              static_cast<std::streamsize>(n_stripes * sizeof(std::uint64_t)));
+    if (!pat) {
+      return Error::io_error("failed writing pattern store shard");
+    }
+  } else {
+    pid = it->second;
   }
-  in.seekg(0, std::ios::end);
-  const auto file_bytes = static_cast<std::uint64_t>(in.tellg());
-  in.seekg(0, std::ios::beg);
-  if (file_bytes % record_bytes != 0) {
-    return Error::io_error("corrupt shard size: " + shard_path.string());
+  KmerMapEntry ent;
+  ent.kmer_code = code;
+  ent.pattern_id = pid;
+  ent.pad = 0;
+  map.write(reinterpret_cast<const char*>(&ent), sizeof(ent));
+  if (!map) {
+    return Error::io_error("failed writing k-mer map shard");
   }
-  const std::uint64_t nrows = file_bytes / record_bytes;
+  return Error::success();
+}
+
+/// Merge code buckets for one partition → pat/map (hierarchical if N > fd_budget).
+Error merge_dedup_partition(std::size_t part, std::size_t n_acc, std::size_t n_stripes,
+                            std::size_t fd_budget, const fs::path& scatter_root,
+                            const fs::path& work, const fs::path& pat_path, const fs::path& map_path,
+                            std::uint64_t& out_patterns, std::uint64_t& out_kmers) {
+  out_patterns = 0;
+  out_kmers = 0;
+
+  std::vector<fs::path> bucket_paths;
+  std::vector<std::size_t> acc_indices;
+  bucket_paths.reserve(n_acc);
+  acc_indices.reserve(n_acc);
+  for (std::size_t i = 0; i < n_acc; ++i) {
+    const fs::path p =
+        scatter_root / ("a" + std::to_string(i)) / ("p" + std::to_string(part) + ".bin");
+    std::error_code ec;
+    if (fs::exists(p, ec) && fs::file_size(p, ec) > 0) {
+      bucket_paths.push_back(p);
+      acc_indices.push_back(i);
+    }
+  }
+  if (bucket_paths.empty()) {
+    std::ofstream(pat_path, std::ios::binary | std::ios::trunc);
+    std::ofstream(map_path, std::ios::binary | std::ios::trunc);
+    return Error::success();
+  }
 
   std::ofstream pat(pat_path, std::ios::binary | std::ios::trunc);
   std::ofstream map(map_path, std::ios::binary | std::ios::trunc);
   if (!pat || !map) {
     return Error::io_error("failed to open shard outputs");
   }
-
   std::unordered_map<PatternKey, std::uint32_t, PatternKeyHash> dedup;
-  if (nrows > 0) {
-    dedup.reserve(static_cast<std::size_t>(std::min<std::uint64_t>(nrows, 1ull << 20)));
-  }
+  dedup.reserve(1u << 16);
 
-  std::vector<char> batch(batch_rows * record_bytes);
-  std::vector<std::uint64_t> words(n_stripes);
-  std::uint64_t done = 0;
-  while (done < nrows) {
-    const std::uint64_t take = std::min<std::uint64_t>(batch_rows, nrows - done);
-    in.read(batch.data(), static_cast<std::streamsize>(take * record_bytes));
-    if (!in) {
-      return Error::io_error("failed reading shard rows: " + shard_path.string());
-    }
-    for (std::uint64_t i = 0; i < take; ++i) {
-      const char* rec = batch.data() + i * record_bytes;
-      std::uint64_t code = 0;
-      std::memcpy(&code, rec, sizeof(code));
-      std::memcpy(words.data(), rec + sizeof(code), n_stripes * sizeof(std::uint64_t));
+  auto on_row = [&](std::uint64_t code, const std::vector<std::uint64_t>& words) -> Error {
+    ++out_kmers;
+    return emit_pattern_row(pat, map, dedup, code, words, n_stripes);
+  };
 
-      PatternKey key;
-      key.words = words;
-      std::uint32_t pid = 0;
-      const auto it = dedup.find(key);
-      if (it == dedup.end()) {
-        if (dedup.size() >= std::numeric_limits<std::uint32_t>::max()) {
-          return Error::invalid_argument(
-              "pattern count exceeds uint32 in one shard; raise --memory-gb or rebuild with more "
-              "partitions");
-        }
-        pid = static_cast<std::uint32_t>(dedup.size());
-        dedup.emplace(std::move(key), pid);
-        pat.write(reinterpret_cast<const char*>(words.data()),
-                  static_cast<std::streamsize>(n_stripes * sizeof(std::uint64_t)));
-        if (!pat) {
-          return Error::io_error("failed writing pattern store shard");
-        }
-      } else {
-        pid = it->second;
-      }
-
-      KmerMapEntry ent;
-      ent.kmer_code = code;
-      ent.pattern_id = pid;
-      ent.pad = 0;
-      map.write(reinterpret_cast<const char*>(&ent), sizeof(ent));
-      if (!map) {
-        return Error::io_error("failed writing k-mer map shard");
+  if (bucket_paths.size() <= fd_budget) {
+    std::vector<CodeCursor> cursors(bucket_paths.size());
+    for (std::size_t i = 0; i < bucket_paths.size(); ++i) {
+      if (auto err = cursors[i].open(bucket_paths[i], acc_indices[i]); !err.ok()) {
+        return err;
       }
     }
-    done += take;
+    std::priority_queue<HeapItem, std::vector<HeapItem>, HeapCmp> heap;
+    for (std::size_t i = 0; i < cursors.size(); ++i) {
+      if (cursors[i].has) {
+        heap.push(HeapItem{cursors[i].code, i});
+      }
+    }
+    std::vector<std::uint64_t> words(n_stripes, 0);
+    while (!heap.empty()) {
+      const std::uint64_t code = heap.top().code;
+      std::fill(words.begin(), words.end(), 0ULL);
+      while (!heap.empty() && heap.top().code == code) {
+        const HeapItem item = heap.top();
+        heap.pop();
+        const std::size_t acc = cursors[item.src].acc;
+        words[acc / kAccessionsPerStripe] |= (1ULL << (acc % kAccessionsPerStripe));
+        if (auto err = cursors[item.src].advance(); !err.ok()) {
+          return err;
+        }
+        if (cursors[item.src].has) {
+          heap.push(HeapItem{cursors[item.src].code, item.src});
+        }
+      }
+      if (auto err = on_row(code, words); !err.ok()) {
+        return err;
+      }
+    }
+  } else {
+    const fs::path part_work = work / ("p" + std::to_string(part) + "_hier");
+    std::error_code ec;
+    fs::create_directories(part_work, ec);
+    const std::size_t group = std::max<std::size_t>(2, fd_budget);
+    std::vector<fs::path> spills;
+    int spill_seq = 0;
+    for (std::size_t begin = 0; begin < bucket_paths.size(); begin += group) {
+      const std::size_t end = std::min(bucket_paths.size(), begin + group);
+      std::vector<fs::path> paths(bucket_paths.begin() + static_cast<std::ptrdiff_t>(begin),
+                                  bucket_paths.begin() + static_cast<std::ptrdiff_t>(end));
+      std::vector<std::size_t> idxs(acc_indices.begin() + static_cast<std::ptrdiff_t>(begin),
+                                    acc_indices.begin() + static_cast<std::ptrdiff_t>(end));
+      const fs::path spill = part_work / ("g" + std::to_string(spill_seq++) + ".rows");
+      if (auto err = merge_codes_to_row_spill(paths, idxs, n_stripes, spill); !err.ok()) {
+        return err;
+      }
+      spills.push_back(spill);
+    }
+    if (auto err = reduce_row_spills(spills, n_stripes, fd_budget, part_work, spill_seq);
+        !err.ok()) {
+      return err;
+    }
+    std::vector<RowCursor> cursors(spills.size());
+    for (std::size_t i = 0; i < spills.size(); ++i) {
+      if (auto err = cursors[i].open(spills[i], n_stripes); !err.ok()) {
+        return err;
+      }
+    }
+    if (auto err = merge_row_cursors(cursors, on_row); !err.ok()) {
+      return err;
+    }
+    fs::remove_all(part_work, ec);
   }
 
   out_patterns = dedup.size();
-  out_kmers = nrows;
   return Error::success();
 }
 
@@ -555,9 +733,9 @@ Error merge_map_files(const std::vector<fs::path>& paths, const std::vector<std:
   return Error::success();
 }
 
-/// Merge many sorted map shards without holding more than fd_budget FDs.
 Error merge_maps_wave(std::vector<fs::path> paths, std::vector<std::uint32_t> offsets,
-                      std::size_t fd_budget, const fs::path& work, std::ofstream& out) {
+                      std::size_t fd_budget, const fs::path& work, std::ofstream& out,
+                      ProgressTicker& progress, std::uint64_t total_kmers) {
   const std::size_t group = std::max<std::size_t>(2, fd_budget);
   int seq = 0;
   while (paths.size() > group) {
@@ -578,7 +756,7 @@ Error merge_maps_wave(std::vector<fs::path> paths, std::vector<std::uint32_t> of
         fs::remove(paths[i], ec);
       }
       next_paths.push_back(tmp);
-      next_offsets.push_back(0);  // already globally adjusted
+      next_offsets.push_back(0);
     }
     paths.swap(next_paths);
     offsets.swap(next_offsets);
@@ -594,6 +772,7 @@ Error merge_maps_wave(std::vector<fs::path> paths, std::vector<std::uint32_t> of
       heap.push(MapHeapItem{cursors[i].ent.kmer_code, i});
     }
   }
+  std::uint64_t written = 0;
   while (!heap.empty()) {
     const auto item = heap.top();
     heap.pop();
@@ -602,6 +781,10 @@ Error merge_maps_wave(std::vector<fs::path> paths, std::vector<std::uint32_t> of
     if (!out) {
       return Error::io_error("failed writing k-mer map to matrix");
     }
+    ++written;
+    if ((written & 0xFFFFFull) == 0) {  // every ~1M rows, also gated by interval
+      progress.tick(written, total_kmers);
+    }
     if (auto err = c.advance(); !err.ok()) {
       return err;
     }
@@ -609,6 +792,7 @@ Error merge_maps_wave(std::vector<fs::path> paths, std::vector<std::uint32_t> of
       heap.push(MapHeapItem{c.ent.kmer_code, item.shard});
     }
   }
+  progress.done(written, total_kmers);
   return Error::success();
 }
 
@@ -655,11 +839,14 @@ Error assemble_v2(const BuildOptions& opts, const fs::path& work, std::size_t n_
     return Error::io_error("failed writing matrix header");
   }
 
-  // Concatenate pattern stores one file at a time (FD-safe for any P).
+  ProgressTicker pat_progress("assemble_patterns");
+  pat_progress.start_log("partitions=" + std::to_string(num_partitions));
   const std::size_t batch_rows = opts.batch_rows > 0 ? opts.batch_rows : 100000;
   std::vector<char> copy_buf(std::max<std::size_t>(1u << 20, batch_rows * n_stripes * 8));
+  std::uint64_t pats_done = 0;
   for (std::size_t i = 0; i < num_partitions; ++i) {
     if (pat_counts[i] == 0) {
+      ++pats_done;
       continue;
     }
     const fs::path pat = work / ("shard_" + std::to_string(i) + ".pat");
@@ -677,7 +864,10 @@ Error assemble_v2(const BuildOptions& opts, const fs::path& work, std::size_t n_
         }
       }
     }
+    ++pats_done;
+    pat_progress.tick(pats_done, num_partitions);
   }
+  pat_progress.done(pats_done, num_partitions);
 
   std::vector<fs::path> map_paths;
   std::vector<std::uint32_t> map_offsets;
@@ -690,11 +880,56 @@ Error assemble_v2(const BuildOptions& opts, const fs::path& work, std::size_t n_
     map_offsets.push_back(offsets[i]);
   }
 
-  if (auto err = merge_maps_wave(std::move(map_paths), std::move(map_offsets), fd_budget, work, out);
+  ProgressTicker map_progress("assemble");
+  map_progress.start_log("map_rows_total=" + std::to_string(total_kmers));
+  if (auto err = merge_maps_wave(std::move(map_paths), std::move(map_offsets), fd_budget, work, out,
+                                 map_progress, total_kmers);
       !err.ok()) {
     return err;
   }
 
+  return Error::success();
+}
+
+Error scatter_accession(std::size_t acc, const std::string& path, std::size_t num_partitions,
+                        std::size_t batch, const fs::path& scatter_root, std::uint64_t& codes_out) {
+  codes_out = 0;
+  PresenceSetCursor cur;
+  if (auto err = cur.open(path); !err.ok()) {
+    return err;
+  }
+  const fs::path adir = scatter_root / ("a" + std::to_string(acc));
+  std::error_code ec;
+  fs::create_directories(adir, ec);
+  if (ec) {
+    return Error::io_error("failed to create scatter dir: " + adir.string());
+  }
+
+  std::vector<CodeBucketWriter> writers(num_partitions);
+  for (std::size_t t = 0; t < num_partitions; ++t) {
+    writers[t].init(adir / ("p" + std::to_string(t) + ".bin"), batch);
+  }
+  while (cur.has_value()) {
+    const std::uint64_t code = cur.value();
+    const std::size_t t = code_partition(code, num_partitions);
+    if (auto err = writers[t].push(code); !err.ok()) {
+      return err;
+    }
+    ++codes_out;
+    if (auto err = cur.advance(); !err.ok()) {
+      return err;
+    }
+  }
+  for (std::size_t t = 0; t < num_partitions; ++t) {
+    if (auto err = writers[t].close(); !err.ok()) {
+      return err;
+    }
+    // Drop empty bucket files to cut inode count.
+    if (!writers[t].created) {
+      fs::remove(writers[t].path, ec);
+    }
+  }
+  cur.close();
   return Error::success();
 }
 
@@ -736,7 +971,6 @@ Error build_matrix_from_presence_sets_streaming(const BuildOptions& opts) {
     }
   } cleaner{work};
 
-  // Header pass: read .kset headers without keeping all FDs (open one at a time).
   std::uint64_t sum_kmers = 0;
   for (std::size_t i = 0; i < n_acc; ++i) {
     PresenceSetCursor cur;
@@ -751,159 +985,91 @@ Error build_matrix_from_presence_sets_streaming(const BuildOptions& opts) {
     cur.close();
   }
 
-  const std::size_t num_partitions =
+  const std::size_t mem_partitions =
       choose_partitions(n_stripes, memory_bytes, threads, batch_rows_req, sum_kmers);
-  const std::size_t batch_rows =
-      effective_batch_rows(batch_rows_req, num_partitions, n_stripes, memory_bytes);
+  const std::size_t num_partitions = std::max(threads, mem_partitions);
+  const std::size_t scatter_batch =
+      scatter_batch_rows(batch_rows_req, num_partitions, threads, memory_bytes);
 
   {
     std::ostringstream msg;
     msg << "streaming build: accessions=" << n_acc << " stripes=" << n_stripes
         << " sum_kmers=" << sum_kmers << " partitions=" << num_partitions
-        << " memory_gb=" << (memory_bytes / (1ull << 30)) << " batch_rows=" << batch_rows
-        << " threads=" << threads << " merge_fd_budget=" << fd_budget;
+        << " memory_gb=" << (memory_bytes / (1ull << 30)) << " scatter_batch=" << scatter_batch
+        << " threads=" << threads << " merge_fd_budget=" << fd_budget
+        << " log_every_sec=" << progress_log_interval_sec();
     log_info(msg.str());
   }
 
-  std::vector<ShardWriter> writers(num_partitions);
-  for (std::size_t p = 0; p < num_partitions; ++p) {
-    const fs::path shard = work / ("shard_" + std::to_string(p) + ".rows");
-    if (auto err = writers[p].init(shard, n_stripes, batch_rows); !err.ok()) {
-      return err;
-    }
-  }
+  const fs::path scatter_root = work / "scatter";
+  fs::create_directories(scatter_root, ec);
 
-  auto partition_row = [&](std::uint64_t code, const std::vector<std::uint64_t>& words) -> Error {
-    const std::size_t part = hash_words(words) % num_partitions;
-    return writers[part].write_row(code, words);
-  };
+  // --- Phase: scatter (parallel over accessions) ---
+  ProgressTicker scatter_progress("scatter");
+  scatter_progress.start_log("accessions=" + std::to_string(n_acc) +
+                             " partitions=" + std::to_string(num_partitions) +
+                             " threads=" + std::to_string(threads));
+  std::atomic<std::uint64_t> accessions_done{0};
+  std::atomic<std::uint64_t> codes_written{0};
+  std::vector<Error> scatter_errors(n_acc, Error::success());
 
-  std::uint64_t unique_emitted = 0;
-  auto count_and_partition = [&](std::uint64_t code,
-                                 const std::vector<std::uint64_t>& words) -> Error {
-    ++unique_emitted;
-    return partition_row(code, words);
-  };
-
-  // Direct path: N fits in FD budget — one multiway merge into partitions.
-  // Hierarchical path: merge accession groups → row spills → reduce → partitions.
-  if (n_acc <= fd_budget) {
-    std::vector<PresenceSetCursor> cursors(n_acc);
-    for (std::size_t i = 0; i < n_acc; ++i) {
-      if (auto err = cursors[i].open(opts.accession_paths[i]); !err.ok()) {
-        return err;
-      }
-    }
-    std::priority_queue<HeapItem, std::vector<HeapItem>, HeapCmp> heap;
-    for (std::size_t i = 0; i < n_acc; ++i) {
-      if (cursors[i].has_value()) {
-        heap.push(HeapItem{cursors[i].value(), i});
-      }
-    }
-    std::vector<std::uint64_t> words(n_stripes, 0);
-    while (!heap.empty()) {
-      const std::uint64_t code = heap.top().code;
-      std::fill(words.begin(), words.end(), 0ULL);
-      while (!heap.empty() && heap.top().code == code) {
-        const HeapItem item = heap.top();
-        heap.pop();
-        const std::size_t stripe = item.src / kAccessionsPerStripe;
-        const std::size_t bit = item.src % kAccessionsPerStripe;
-        words[stripe] |= (1ULL << bit);
-        if (auto err = cursors[item.src].advance(); !err.ok()) {
-          return err;
-        }
-        if (cursors[item.src].has_value()) {
-          heap.push(HeapItem{cursors[item.src].value(), item.src});
-        }
-      }
-      if (auto err = count_and_partition(code, words); !err.ok()) {
-        return err;
-      }
-    }
-    for (auto& c : cursors) {
-      c.close();
-    }
-  } else {
-    log_info("hierarchical merge: accessions=" + std::to_string(n_acc) +
-             " > merge_fd_budget=" + std::to_string(fd_budget));
-    const std::size_t group = std::max<std::size_t>(2, fd_budget);
-    std::vector<fs::path> spills;
-    int spill_seq = 0;
-    for (std::size_t begin = 0; begin < n_acc; begin += group) {
-      const std::size_t end = std::min(n_acc, begin + group);
-      std::vector<std::string> paths;
-      std::vector<std::size_t> idxs;
-      paths.reserve(end - begin);
-      idxs.reserve(end - begin);
-      for (std::size_t i = begin; i < end; ++i) {
-        paths.push_back(opts.accession_paths[i]);
-        idxs.push_back(i);
-      }
-      const fs::path spill = work / ("acc_merge_" + std::to_string(spill_seq++) + ".rows");
-      if (auto err = merge_ksets_to_spill(paths, idxs, n_stripes, spill); !err.ok()) {
-        return err;
-      }
-      spills.push_back(spill);
-    }
-    if (auto err = reduce_row_spills(spills, n_stripes, fd_budget, work, spill_seq); !err.ok()) {
-      return err;
-    }
-    std::vector<RowCursor> cursors(spills.size());
-    for (std::size_t i = 0; i < spills.size(); ++i) {
-      if (auto err = cursors[i].open(spills[i], n_stripes); !err.ok()) {
-        return err;
-      }
-    }
-    if (auto err = merge_row_cursors(cursors, count_and_partition); !err.ok()) {
-      return err;
-    }
-    for (const auto& p : spills) {
-      std::error_code ignore;
-      fs::remove(p, ignore);
-    }
-  }
-
-  for (std::size_t p = 0; p < num_partitions; ++p) {
-    if (auto err = writers[p].close(); !err.ok()) {
-      return err;
-    }
-  }
-
-  log_info("merge complete: unique_kmers=" + std::to_string(unique_emitted) +
-           "; deduplicating shards");
-  std::vector<std::uint64_t> pat_counts(num_partitions, 0);
-  std::vector<std::uint64_t> kmer_counts(num_partitions, 0);
-  std::vector<Error> errors(num_partitions, Error::success());
-
-  // Concurrent shard workers: each opens ~3 FDs; keep thread count within budget.
-  const std::size_t shard_threads = std::min(threads, std::max<std::size_t>(1, fd_budget / 4));
-
-  parallel_for(0, num_partitions, shard_threads, [&](std::size_t p) {
-    const fs::path shard = work / ("shard_" + std::to_string(p) + ".rows");
-    const fs::path pat = work / ("shard_" + std::to_string(p) + ".pat");
-    const fs::path map = work / ("shard_" + std::to_string(p) + ".map");
-    std::error_code exists_ec;
-    if (!fs::exists(shard, exists_ec) || fs::file_size(shard, exists_ec) == 0) {
-      pat_counts[p] = 0;
-      kmer_counts[p] = 0;
-      std::ofstream(pat, std::ios::binary | std::ios::trunc);
-      std::ofstream(map, std::ios::binary | std::ios::trunc);
+  parallel_for(0, n_acc, threads, [&](std::size_t i) {
+    std::uint64_t codes = 0;
+    if (auto err =
+            scatter_accession(i, opts.accession_paths[i], num_partitions, scatter_batch,
+                              scatter_root, codes);
+        !err.ok()) {
+      scatter_errors[i] = err;
       return;
     }
-    if (auto err = process_shard(shard, pat, map, n_stripes, batch_rows, pat_counts[p],
-                                 kmer_counts[p]);
-        !err.ok()) {
-      errors[p] = err;
-    }
-    fs::remove(shard, exists_ec);
+    codes_written.fetch_add(codes, std::memory_order_relaxed);
+    const std::uint64_t done = accessions_done.fetch_add(1, std::memory_order_relaxed) + 1;
+    scatter_progress.tick(done, n_acc, "codes=" + std::to_string(codes_written.load()));
   });
 
-  for (const Error& err : errors) {
+  for (const Error& err : scatter_errors) {
     if (!err.ok()) {
       return err;
     }
   }
+  scatter_progress.done(n_acc, n_acc, "codes=" + std::to_string(codes_written.load()));
+
+  // --- Phase: parallel merge + pattern dedup per code partition ---
+  const std::size_t merge_workers =
+      std::min(threads, std::max<std::size_t>(1, fd_budget / 4));
+  ProgressTicker merge_progress("merge_dedup");
+  merge_progress.start_log("partitions=" + std::to_string(num_partitions) +
+                           " workers=" + std::to_string(merge_workers));
+
+  std::vector<std::uint64_t> pat_counts(num_partitions, 0);
+  std::vector<std::uint64_t> kmer_counts(num_partitions, 0);
+  std::vector<Error> merge_errors(num_partitions, Error::success());
+  std::atomic<std::uint64_t> parts_done{0};
+
+  parallel_for(0, num_partitions, merge_workers, [&](std::size_t p) {
+    const fs::path pat = work / ("shard_" + std::to_string(p) + ".pat");
+    const fs::path map = work / ("shard_" + std::to_string(p) + ".map");
+    if (auto err = merge_dedup_partition(p, n_acc, n_stripes, fd_budget, scatter_root, work, pat,
+                                         map, pat_counts[p], kmer_counts[p]);
+        !err.ok()) {
+      merge_errors[p] = err;
+    }
+    const std::uint64_t done = parts_done.fetch_add(1, std::memory_order_relaxed) + 1;
+    merge_progress.tick(done, num_partitions);
+  });
+
+  for (const Error& err : merge_errors) {
+    if (!err.ok()) {
+      return err;
+    }
+  }
+  const std::uint64_t unique_emitted =
+      std::accumulate(kmer_counts.begin(), kmer_counts.end(), 0ull);
+  merge_progress.done(num_partitions, num_partitions,
+                      "unique_kmers=" + std::to_string(unique_emitted));
+
+  // Scatter trees no longer needed.
+  fs::remove_all(scatter_root, ec);
 
   log_info("assembling v2 matrix: patterns=" +
            std::to_string(std::accumulate(pat_counts.begin(), pat_counts.end(), 0ull)) +

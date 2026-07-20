@@ -19,7 +19,13 @@ The first in-RAM builder loaded every `.kset` into `vector`s and inserted all un
 
 bytes (plus allocator / tree overhead), which OOMs even on large HPC nodes.
 
-Production build **multiway-merges** sorted `.kset` streams, **hash-partitions** by presence-pattern fingerprint into spill shards under `--tmpdir`, **deduplicates patterns per shard** (parallel), then assembles a v2 `.kmat`. Peak RAM is sized from `--memory-gb`, not from panel unique-kmer count.
+Production build:
+
+1. **Scatter** (parallel over accessions): hash-partition each `.kset` by k-mer code into \(T\) sorted buckets under `--tmpdir`
+2. **Merge+dedup** (parallel over partitions): multiway-merge the \(N\) buckets for each code partition, build presence words, dedupe patterns → `.pat` / `.map`
+3. **Assemble** v2 `.kmat` (pattern concat + wave-merge of sorted maps)
+
+Peak RAM is sized from `--memory-gb`, not from panel unique-kmer count. `--threads` drives both scatter and merge+dedup concurrency.
 
 ## CLI
 
@@ -34,29 +40,44 @@ kmat --profile hpc --threads 16 build \
 | Flag | Meaning |
 |---|---|
 | `--memory-gb` | Working-set budget (GiB). Drives partition count. `0` → profile default (laptop **8**, hpc **64**). |
-| `--batch-rows` | Requested rows per shard I/O flush (default **100000**). May be lowered automatically so \(P\) writer buffers fit in ~¼ of the budget. |
-| `--tmpdir` | Spill directory for partition / merge shards (deleted after success). |
-| `--threads` | Parallel shard pattern-dedup (and global runtime workers). |
+| `--batch-rows` | Requested rows per I/O flush (default **100000**). Scatter batch may be lowered so \(T\) bucket buffers fit. |
+| `--tmpdir` | Spill directory for scatter buckets / shards (deleted after success). Prefer `$SLURM_TMPDIR`. |
+| `--threads` | Parallel scatter over accessions **and** parallel per-partition merge+dedup. |
 
-Slurm helper [hpc/run_build.slurm](../../hpc/run_build.slurm) sets `set -euo pipefail`, passes `--memory-gb` ≈ 90% of `--mem`, and uses `$SLURM_TMPDIR` when present.
+Slurm helper [hpc/run_build.slurm](../../hpc/run_build.slurm) sets `set -euo pipefail`, passes `--memory-gb` ≈ 90% of `--mem`, raises `ulimit -n`, and uses `$SLURM_TMPDIR` when present.
+
+## Progress logging
+
+Long phases emit heartbeats about every **30s** (override with `KMAT_BUILD_LOG_EVERY_SEC`):
+
+```text
+[kmat:info] scatter: start accessions=440 partitions=64 threads=16
+[kmat:info] scatter: 120/440 (27.3%) elapsed=300s rate=0.40/s codes=... eta=800s
+[kmat:info] merge_dedup: 8/64 (12.5%) elapsed=45s rate=0.18/s eta=311s
+[kmat:info] assemble: 2100000000/8400000000 (25.0%) elapsed=90s rate=23.3e6/s eta=270s
+```
+
+Each phase also logs a final `… done` line with totals and elapsed time.
 
 ## Scalability model (N=10³–10⁴, large genomes)
 
 | Resource | Bound | Behaviour |
 |---|---|---|
-| Open files during merge | `RLIMIT_NOFILE` (soft raised to hard at start) | If \(N\) ≤ budget → one multiway merge. If \(N\) > budget → **hierarchical** group merge into sorted row spills, then reduce. |
-| Partition count \(P\) | Memory + absolute cap **65536** | Sized so expected rows/shard fit in `memory/threads`. \(\sum K_i\) is only an **upper bound** on unique \(U\) (makes \(P\) larger / safer). **Not** capped at 128. |
-| Shard FDs while writing | 1 at a time | Writers **open-append-close** on flush — large \(P\) does not mean large concurrent FDs. |
-| Map assemble | FD budget | Pattern shards concatenated one-at-a-time; map shards multiway-merged in **waves** if \(P\) is large. |
-| Pattern ids | `uint32` | Build fails clearly if a shard or the total exceeds \(2^{32}-1\). |
+| Open files during merge+dedup | `RLIMIT_NOFILE` (soft raised to hard) | Per partition: if live bucket count ≤ budget → one multiway merge; else **hierarchical** reduce. Concurrent workers capped by FD budget. |
+| Partition count \(T\) | `max(threads, memory sizing)`, cap **65536** | Code-hash partitions. \(\sum K_i\) upper-bounds unique \(U\) (larger \(T\) = safer RAM). |
+| Scatter FDs | open-append-close per bucket flush | Large \(T\) does not hold \(T\) FDs open. |
+| Map assemble | FD budget | Patterns concatenated one file at a time; maps wave-merged. |
+| Pattern ids | `uint32` | Fails clearly if a shard or total exceeds \(2^{32}-1\). |
+| Pattern store size | — | Same presence pattern may appear in multiple code partitions (duplicate rows). Presence per k-mer is correct; GWAS may re-test identical patterns. |
 
-Do **not** treat teff (N≈440) as the design point: wheat-scale panels need hierarchical merge and memory-driven \(P\), not hard FD×partition coupling.
+Debug / tests:
 
-Debug / tests: `KMAT_BUILD_MAX_OPEN=<n>` forces a tiny merge FD budget (exercises hierarchical path).
+- `KMAT_BUILD_MAX_OPEN=<n>` — tiny merge FD budget (hierarchical path)
+- `KMAT_BUILD_LOG_EVERY_SEC=<n>` — heartbeat interval
 
 ## Memory model
 
-`--memory-gb` budgets per-shard pattern tables (~`memory/threads` each) and aggregate writer buffers (~¼ budget). Raising it lowers \(P\) (fewer, larger shards). Lowering it raises \(P\) (more spill, less RAM per shard).
+`--memory-gb` budgets per-partition pattern tables (~`memory/threads` each) and scatter buffers. Raising it lowers \(T\) (fewer, larger partitions). Lowering it raises \(T\).
 
 What it does **not** mean: keeping the full unique-kmer table or all accession lists resident.
 
@@ -65,10 +86,10 @@ What it does **not** mean: keeping the full unique-kmer table or all accession l
 | Panel | `--mem` | `--cpus-per-task` | Notes |
 |---|---|---|---|
 | Toy / medium fixtures | 8–32G | 4–8 | Fine for CI-sized `.kset` |
-| ~440 accession teff-scale | 64–256G | 8–16 | Start at 64G; raise if a shard still OOMs |
-| 1k–10k accessions / wheat-like \(U\) | 256–512G+ | 16–32 | Prefer node-local `$SLURM_TMPDIR`; hierarchical merge if soft `nofile` stays ~1024 |
+| ~440 accession teff-scale | 64–256G | 8–16 | Start at 16 threads; prefer node-local scratch |
+| 1k–10k accessions / wheat-like \(U\) | 256–512G+ | 16–32 | `$SLURM_TMPDIR`; hierarchical merge if soft `nofile` stays ~1024 |
 
-Do **not** set `--threads` near 64 unless `--mem` is large: more threads means more concurrent shard tables.
+Do **not** jump to `--threads 64` on NFS scratch without checking I/O: scatter is write-heavy.
 
 ## Lessons learned (do not regress)
 
@@ -80,9 +101,10 @@ Do **not** set `--threads` near 64 unless `--mem` is large: more threads means m
 6. **Build must not hold \(\sum\) accession k-mer lists** or a monolithic `map<code, bitvector>` for production N.
 7. **Legacy win was bounded I/O batches (100k rows)** + external parallelism — port that idea; do not treat create-blank-then-fill as the only design.
 8. **Slurm scripts need `set -e`** so OOM/killed builds are not reported as success after a trailing `echo Done`.
-9. **File-descriptor limits matter, but do not hard-cap partitions for FDs.** Merge may keep one FD per live input stream; shard writers must not hold \(P\) FDs. When \(N\) exceeds the FD budget, merge hierarchically. A mistaken `P≤128` hard cap makes large-\(U\) shards OOM.
+9. **File-descriptor limits matter, but do not hard-cap partitions for FDs.** Scatter/merge must not hold \(T\) or \(N\cdot T\) FDs. Hierarchical merge when \(N\) exceeds the FD budget.
 10. **Keep `singularity exec … kmat … build` as one shell command.** Commenting out only the `singularity exec \` line leaves a bare `build` → `command not found`.
-11. **Never size \(P\) from \(\sum K_i\) while also opening \(P\) files.** \(\sum K_i\) as a \(U\) upper bound is fine for *memory* sizing only.
+11. **Never size \(T\) from \(\sum K_i\) while also opening \(T\) files.** \(\sum K_i\) as a \(U\) upper bound is fine for *memory* sizing only.
+12. **A global single-threaded multiway merge of all `.kset` files will sit at 1× CPU for hours** with no progress logs — partition by code and heartbeat regularly.
 
 ## Sequence-file build
 
