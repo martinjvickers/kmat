@@ -13,6 +13,6 @@ even though `zcat` / system zlib read the same files fine.
 | File | Purpose |
 |---|---|
 | `binary_reader.h` | Decompress `.gz` with `gzopen`/`gzread`, feed plain FASTQ packs to readers |
-| `apply-kmc-system-zlib.sh` | Patch KMC `Makefile` to link system `-lz` instead of Cloudflare `libz.a` |
+| `apply-kmc-system-zlib.sh` | Patch KMC `Makefile` + `fastq_reader.h` includes to use system `<zlib.h>` / `-lz` |
 
 Applied during `singularity/kmat.def` `%post`.

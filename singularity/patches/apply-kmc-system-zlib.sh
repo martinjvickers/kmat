@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Patch refresh-bio/KMC Makefile (v3.2.4) to link system zlib instead of Cloudflare."""
+"""Patch refresh-bio/KMC (v3.2.4) to use system zlib instead of Cloudflare."""
 from __future__ import annotations
 
 from pathlib import Path
 
-mk = Path("Makefile")
+ROOT = Path(".")
+
+# --- Makefile ---
+mk = ROOT / "Makefile"
 text = mk.read_text()
 
 replacements = [
@@ -46,3 +49,17 @@ for old, new in replacements:
 
 mk.write_text(text)
 print("patched Makefile for system zlib")
+
+# --- Source includes (hardcoded Cloudflare path) ---
+include_old = '#include "../3rd_party/cloudflare/zlib.h"'
+include_new = "#include <zlib.h>"
+include_files = [
+    ROOT / "kmc_core" / "fastq_reader.h",
+    ROOT / "kmc_tools" / "fastq_reader.h",
+]
+for path in include_files:
+    src = path.read_text()
+    if include_old not in src:
+        raise SystemExit(f"include patch failed in {path}: Cloudflare zlib include not found")
+    path.write_text(src.replace(include_old, include_new, 1))
+    print(f"patched include in {path}")
