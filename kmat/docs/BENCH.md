@@ -54,7 +54,7 @@ CTest smoke: `kmat_bench_laptop_tiny`, `kmat_bench_hpc_tiny` (must complete succ
 
 | Engine | When | Notes |
 |---|---|---|
-| `kmc` (default) | Production / Singularity | Calls `kmc` + `kmc_tools`; `--threads` → KMC `-t`; spills under `--tmpdir`/`$TMPDIR` |
+| `kmc` (default) | Production / Singularity | Calls patched `kmc` + `kmc_tools` (system zlib / `gzread`); `--threads` → KMC `-t`; spills under `--tmpdir`/`$TMPDIR` |
 | `builtin` | Tests / no KMC | In-process hashmap; fine for tiny FASTA only |
 
-Rebuild the Singularity image after pulling so KMC is on `PATH` inside the container.
+Rebuild the Singularity image from the **repo root** after pulling so the patched KMC is on `PATH` inside the container.

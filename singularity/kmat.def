@@ -1,38 +1,35 @@
 Bootstrap: docker
 From: ubuntu:22.04
 
+# Build from the repository root so %files resolves:
+#   sudo singularity build ~/bin/kmat.img singularity/kmat.def
+
+%files
+    singularity/patches/binary_reader.h /opt/kmat-patches/binary_reader.h
+    singularity/patches/apply-kmc-system-zlib.sh /opt/kmat-patches/apply-kmc-system-zlib.sh
+
 %post
+    set -e
     apt-get update
     apt-get install -y --no-install-recommends \
-        build-essential ca-certificates cmake git pkg-config wget zlib1g-dev
+        build-essential ca-certificates cmake git pkg-config python3 wget zlib1g-dev
     rm -rf /var/lib/apt/lists/*
 
-    # Upstream KMC only — do NOT apt-install kmc (distro builds often break on .fq.gz).
-    echo "installing upstream KMC 3.2.4"
-    mkdir -p /usr/local/bin
+    # Build KMC from source with system zlib + gzFile reader patch.
+    # Stock release binaries (Cloudflare zlib + manual inflate) fail on many
+    # real Illumina/pigz .fq.gz with: "Some error while reading gzip file".
+    echo "building patched KMC 3.2.4 (system zlib + gzread)"
     cd /tmp
-    wget -O KMC3.2.4.linux.x64.tar.gz \
-      https://github.com/refresh-bio/KMC/releases/download/v3.2.4/KMC3.2.4.linux.x64.tar.gz
-    tar -xzf KMC3.2.4.linux.x64.tar.gz
-    KMC_BIN=$(find /tmp -type f -name kmc ! -name '*.*' | head -n 1)
-    TOOLS_BIN=$(find /tmp -type f -name kmc_tools ! -name '*.*' | head -n 1)
-    if [ -z "$KMC_BIN" ] || [ -z "$TOOLS_BIN" ]; then
-        echo "ERROR: kmc/kmc_tools not found in release tarball" >&2
-        find /tmp -maxdepth 3 -type f | head -50 >&2
-        exit 1
-    fi
-    cp -f "$KMC_BIN" /usr/local/bin/kmc
-    cp -f "$TOOLS_BIN" /usr/local/bin/kmc_tools
-    chmod +x /usr/local/bin/kmc /usr/local/bin/kmc_tools
-    rm -rf /tmp/KMC3.2.4.linux.x64.tar.gz
-    find /tmp -maxdepth 2 -type d -name 'kmc*' -exec rm -rf {} + 2>/dev/null || true
-    find /tmp -maxdepth 2 -type d -name 'bin' -exec rm -rf {} + 2>/dev/null || true
+    git clone --depth 1 --branch v3.2.4 https://github.com/refresh-bio/KMC.git KMC
+    cd KMC
+    cp -f /opt/kmat-patches/binary_reader.h kmc_core/binary_reader.h
+    python3 /opt/kmat-patches/apply-kmc-system-zlib.sh
+
+    make -j"$(nproc)" kmc kmc_tools
+    install -m 0755 bin/kmc bin/kmc_tools /usr/local/bin/
     /usr/local/bin/kmc 2>/dev/null || true
-    ls -la /usr/local/bin/kmc /usr/local/bin/kmc_tools
-    # Ensure apt kmc is not present / not preferred
-    if [ -e /usr/bin/kmc ] && [ ! -L /usr/bin/kmc ]; then
-        echo "NOTE: /usr/bin/kmc exists; PATH prefers /usr/local/bin"
-    fi
+    ldd /usr/local/bin/kmc || true
+    rm -rf /tmp/KMC
 
     git clone --depth 1 https://github.com/martinjvickers/kmat.git /opt/kmat-src
 
@@ -42,12 +39,12 @@ From: ubuntu:22.04
         SRC=/opt/kmat-src/kmat
     fi
 
-    cmake -S $SRC -B /tmp/kmat-build \
+    cmake -S "$SRC" -B /tmp/kmat-build \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/usr/local \
         -DKMAT_BUILD_TESTS=OFF \
         -DKMAT_BUILD_BENCHES=OFF
-    cmake --build /tmp/kmat-build -j$(nproc)
+    cmake --build /tmp/kmat-build -j"$(nproc)"
     cmake --install /tmp/kmat-build
     rm -rf /tmp/kmat-build /opt/kmat-src
 

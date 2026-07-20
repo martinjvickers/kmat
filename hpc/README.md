@@ -17,10 +17,11 @@ sbatch --dependency=afterok:${COUNT} run_build.slurm
 
 Defaults: `$HOME/bin/kmat.img`, `paths.txt`, `-s 31 --ci 2`, `--cpus-per-task=8` for KMC `-t`.
 
-KMC reads `.fq.gz` natively. The image must ship **upstream** KMC under `/usr/local/bin` (not the Debian `/usr/bin/kmc` package, which often fails with “Some error while reading gzip file”).
+KMC reads `.fq.gz` natively. The image builds a **patched KMC 3.2.4** (system zlib + `gzread`) — stock release/apt KMC often fails with “Some error while reading gzip file”.
 
 ```bash
+# from the repo root (so %files can find singularity/patches/)
 sudo singularity build ~/bin/kmat.img singularity/kmat.def
-# verify:
-singularity exec ~/bin/kmat.img which kmc    # expect /usr/local/bin/kmc
+singularity exec ~/bin/kmat.img which kmc          # /usr/local/bin/kmc
+singularity exec ~/bin/kmat.img ldd $(which kmc)   # should list libz.so
 ```

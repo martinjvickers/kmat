@@ -154,7 +154,7 @@ const char* kmc_input_flag(const std::string& path) {
   if (path_looks_fasta(path)) {
     return "-fm";
   }
-  // Default FASTQ (including .fq.gz / .fastq.gz — KMC reads gzip natively).
+  // Default FASTQ (including .fq.gz — patched KMC in the image reads gzip via zlib gzFile).
   return "-fq";
 }
 
@@ -201,8 +201,9 @@ Error dump_to_kset(const std::string& dump_path, const CountOptions& opts) {
 }
 
 Error count_kmc(const CountOptions& opts) {
-  // Prefer upstream binaries shipped in /usr/local/bin (Singularity image). Distro
-  // /usr/bin/kmc packages are often broken on .fq.gz ("Some error while reading gzip file").
+  // Prefer patched KMC from the Singularity image (/usr/local/bin). Stock
+  // release binaries use Cloudflare zlib + a manual inflate loop that fails on
+  // many real Illumina/pigz .fq.gz files ("Some error while reading gzip file").
   std::string kmc_bin = opts.kmc_bin;
   std::string kmc_tools_bin = opts.kmc_tools_bin;
   if (kmc_bin.empty()) {
@@ -224,20 +225,20 @@ Error count_kmc(const CountOptions& opts) {
   std::string resolved_tools;
   if (!find_executable(kmc_bin, resolved_kmc)) {
     return Error::io_error(
-        "kmc not found on PATH (install upstream KMC 3.x into the image, or use --engine "
-        "builtin). Looked for: " +
+        "kmc not found on PATH (install patched KMC via singularity/kmat.def, or use "
+        "--engine builtin). Looked for: " +
         kmc_bin);
   }
   if (!find_executable(kmc_tools_bin, resolved_tools)) {
     return Error::io_error(
-        "kmc_tools not found on PATH (install upstream KMC 3.x into the image, or use "
-        "--engine builtin). Looked for: " +
+        "kmc_tools not found on PATH (install patched KMC via singularity/kmat.def, or "
+        "use --engine builtin). Looked for: " +
         kmc_tools_bin);
   }
   if (resolved_kmc == "/usr/bin/kmc") {
     log_info(
-        "warning: using /usr/bin/kmc (often lacks working gzip support); prefer upstream "
-        "KMC in /usr/local/bin from singularity/kmat.def");
+        "warning: using /usr/bin/kmc; prefer the patched KMC in /usr/local/bin from "
+        "singularity/kmat.def (stock KMC often fails on .fq.gz)");
   }
 
   const std::size_t threads =
@@ -281,7 +282,7 @@ Error count_kmc(const CountOptions& opts) {
            tflag.str() + " " + format_flag + " " + opts.input_path);
 
   {
-    // Pass .fq.gz / .fastq.gz straight through — upstream KMC reads gzip natively.
+    // Pass .fq.gz straight through. Image KMC is patched to gzread (no gunzip-to-disk).
     std::vector<std::string> args = {resolved_kmc,       "-hp",
                                      kflag.str(),        ciflag.str(),
                                      csflag.str(),       tflag.str(),
