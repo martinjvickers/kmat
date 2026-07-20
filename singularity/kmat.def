@@ -34,6 +34,7 @@ From: ubuntu:22.04
     #   "Some error while reading gzip file"
     echo "building patched KMC 3.2.4 (system zlib + gzread)"
     cd /tmp
+    rm -rf KMC
     git clone --depth 1 --branch v3.2.4 https://github.com/refresh-bio/KMC.git KMC
     cd KMC
     cp -f "$PATCH_DIR/binary_reader.h" kmc_core/binary_reader.h
