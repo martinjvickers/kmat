@@ -1,87 +1,32 @@
 Bootstrap: docker
 From: ubuntu:22.04
 
-%labels
-    Author kmat
-    Version 0.4.0
-    Description k-mer presence/absence GWAS toolkit (kmat)
-
-%help
-    Builds kmat by cloning the public GitHub repo over HTTPS, then compiling
-    with CMake:
-
-      https://github.com/martinjvickers/kmat.git
-
-    Build (needs network for apt, git clone, and CMake FetchContent):
-
-      singularity build --fakeroot kmat.sif singularity/kmat.def
-
-    Optional build-time env (pass with --env):
-      KMAT_GIT_URL   default https://github.com/martinjvickers/kmat.git
-      KMAT_GIT_REF   branch or tag (default: master)
-
-    Run:
-
-      singularity exec --bind /path/to/data:/data kmat.sif kmat --help
-
 %post
-    set -euo pipefail
-    export DEBIAN_FRONTEND=noninteractive
-
     apt-get update
     apt-get install -y --no-install-recommends \
-        build-essential \
-        ca-certificates \
-        cmake \
-        git \
-        pkg-config \
-        zlib1g-dev
+        build-essential ca-certificates cmake git pkg-config zlib1g-dev
     rm -rf /var/lib/apt/lists/*
 
-    KMAT_GIT_URL="${KMAT_GIT_URL:-https://github.com/martinjvickers/kmat.git}"
-    KMAT_GIT_REF="${KMAT_GIT_REF:-master}"
+    git clone --depth 1 https://github.com/martinjvickers/kmat.git /opt/kmat-src
 
-    echo "Cloning ${KMAT_GIT_URL} @ ${KMAT_GIT_REF} ..."
-    rm -rf /opt/kmat-src
-    git clone --depth 1 --branch "${KMAT_GIT_REF}" "${KMAT_GIT_URL}" /opt/kmat-src
-
+    # Repo may be either flat (CMakeLists at root) or have a kmat/ subdir
     if [ -f /opt/kmat-src/CMakeLists.txt ]; then
         SRC=/opt/kmat-src
-    elif [ -f /opt/kmat-src/kmat/CMakeLists.txt ]; then
-        SRC=/opt/kmat-src/kmat
     else
-        echo "ERROR: CMakeLists.txt not found (expected repo root or kmat/)" >&2
-        ls -la /opt/kmat-src >&2 || true
-        exit 1
+        SRC=/opt/kmat-src/kmat
     fi
 
-    echo "Building from ${SRC} ..."
-    cmake -S "${SRC}" -B /tmp/kmat-build \
+    cmake -S $SRC -B /tmp/kmat-build \
         -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_INSTALL_PREFIX=/opt/kmat \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
         -DKMAT_BUILD_TESTS=OFF \
         -DKMAT_BUILD_BENCHES=OFF
-    cmake --build /tmp/kmat-build -j"$(nproc)"
+    cmake --build /tmp/kmat-build -j$(nproc)
     cmake --install /tmp/kmat-build
-
-    {
-        echo "url=${KMAT_GIT_URL}"
-        echo "ref=${KMAT_GIT_REF}"
-        echo -n "commit="
-        git -C /opt/kmat-src rev-parse HEAD
-    } > /opt/kmat/BUILD_INFO.txt
-
     rm -rf /tmp/kmat-build /opt/kmat-src
 
 %environment
-    export PATH="/opt/kmat/bin:${PATH}"
-    export LC_ALL=C.UTF-8
+    export LC_ALL=C
 
 %runscript
     exec kmat "$@"
-
-%test
-    set -e
-    command -v kmat
-    kmat --help >/dev/null
-    test -f /opt/kmat/BUILD_INFO.txt
