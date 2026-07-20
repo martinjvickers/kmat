@@ -4,6 +4,7 @@ add_executable(kmat_tests
   test_stats.cpp
   test_fastq.cpp
   test_count.cpp
+  test_build_stream.cpp
   test_runtime.cpp
   test_integration.cpp
   test_integration_medium.cpp

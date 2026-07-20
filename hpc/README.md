@@ -17,6 +17,8 @@ sbatch --dependency=afterok:${COUNT} run_build.slurm
 
 Defaults: `$HOME/bin/kmat.img`, `paths.txt`, `-s 31 --ci 2`, `--cpus-per-task=8` for KMC `-t`.
 
+**Build** (`run_build.slurm`) is one job: streams `.kset` → `panel.kmat` with `--memory-gb` ≈ 90% of Slurm `--mem` (override with `MEMORY_GB=`). Details: [`kmat/docs/BUILD.md`](../kmat/docs/BUILD.md).
+
 KMC reads `.fq.gz` natively. The image builds a **patched KMC 3.2.4** (system zlib + `gzread`) — stock release/apt KMC often fails with “Some error while reading gzip file”.
 
 ```bash

@@ -1,6 +1,8 @@
 #include "kmat/matrix.hpp"
 
+#include "kmat/build_stream.hpp"
 #include "kmat/fastq.hpp"
+#include "kmat/log.hpp"
 #include "kmat/presence.hpp"
 #include "kmat/runtime.hpp"
 #include "kmat/sequence.hpp"
@@ -342,6 +344,10 @@ Error build_matrix_from_sequences(const BuildOptions& opts) {
     return err;
   }
 
+  log_warn(
+      "building from sequence files loads k-mers in RAM; production panels should use "
+      "`kmat count` → `.kset` then memory-bounded `kmat build`");
+
   const std::size_t n_acc = opts.accession_paths.size();
   std::vector<std::vector<std::uint64_t>> accession_kmers(n_acc);
   std::vector<Error> errors(n_acc, Error::success());
@@ -377,34 +383,8 @@ Error build_matrix_from_presence_sets(const BuildOptions& opts) {
   if (auto err = validate_build_options(opts); !err.ok()) {
     return err;
   }
-
-  const std::size_t n_acc = opts.accession_paths.size();
-  std::vector<std::vector<std::uint64_t>> accession_kmers(n_acc);
-  std::vector<Error> errors(n_acc, Error::success());
-  const std::size_t threads = opts.num_threads > 0 ? opts.num_threads
-                                                   : effective_threads(runtime_config());
-
-  parallel_for(0, n_acc, threads, [&](std::size_t i) {
-    PresenceSet set;
-    if (auto err = read_presence_set(opts.accession_paths[i], set); !err.ok()) {
-      errors[i] = err;
-      return;
-    }
-    if (set.header.kmer_size != opts.kmer_size) {
-      errors[i] = Error::invalid_argument("presence set k-mer size mismatch: " +
-                                          opts.accession_paths[i]);
-      return;
-    }
-    accession_kmers[i] = std::move(set.kmers);
-  });
-
-  for (const Error& err : errors) {
-    if (!err.ok()) {
-      return err;
-    }
-  }
-
-  return write_v2_from_accession_kmers(opts, std::move(accession_kmers));
+  // Production path: stream sorted .ksets under --memory-gb (never load all vectors).
+  return build_matrix_from_presence_sets_streaming(opts);
 }
 
 Error build_matrix_from_accessions(const BuildOptions& opts) {

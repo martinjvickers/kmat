@@ -14,6 +14,7 @@ add_library(kmat_lib
   src/runtime.cpp
   src/table.cpp
   src/matrix.cpp
+  src/build_stream.cpp
   src/pca.cpp
   src/gwas.cpp
   src/gene.cpp

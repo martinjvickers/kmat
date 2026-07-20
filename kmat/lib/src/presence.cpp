@@ -95,4 +95,59 @@ Error read_presence_set(const std::string& path, PresenceSet& set) {
   return Error::success();
 }
 
+Error PresenceSetCursor::open(const std::string& path) {
+  close();
+  path_ = path;
+  in_.open(path, std::ios::binary);
+  if (!in_) {
+    return Error::io_error("failed to open presence set: " + path);
+  }
+  in_.read(reinterpret_cast<char*>(&header_), sizeof(PresenceHeader));
+  if (!in_) {
+    return Error::io_error("failed to read presence set header: " + path);
+  }
+  if (header_.magic[0] != 'K' || header_.magic[1] != 'S' || header_.magic[2] != 'E' ||
+      header_.magic[3] != 'T') {
+    return Error::invalid_argument("invalid presence set magic (expected KSET): " + path);
+  }
+  if (header_.version != 1) {
+    return Error::invalid_argument("unsupported presence set version: " + path);
+  }
+  remaining_ = header_.num_kmers;
+  ok_ = true;
+  has_value_ = false;
+  return advance();
+}
+
+void PresenceSetCursor::close() {
+  in_.close();
+  ok_ = false;
+  has_value_ = false;
+  remaining_ = 0;
+  path_.clear();
+}
+
+Error PresenceSetCursor::advance() {
+  has_value_ = false;
+  if (!ok_) {
+    return Error::io_error("presence set cursor is not open");
+  }
+  if (remaining_ == 0) {
+    return Error::success();
+  }
+  const std::uint64_t prev = value_;
+  in_.read(reinterpret_cast<char*>(&value_), sizeof(std::uint64_t));
+  if (!in_) {
+    ok_ = false;
+    return Error::io_error("unexpected EOF reading presence set k-mers: " + path_);
+  }
+  if (remaining_ < header_.num_kmers && value_ <= prev) {
+    ok_ = false;
+    return Error::invalid_argument("presence set k-mers are not sorted: " + path_);
+  }
+  --remaining_;
+  has_value_ = true;
+  return Error::success();
+}
+
 }  // namespace kmat

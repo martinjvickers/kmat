@@ -62,7 +62,7 @@ On wheat-scale data, many k-mers share the same PA vector (~2/3 duplicates obser
 
 ### Build
 
-`kmat build` writes **v2** by default: online dedup of presence vectors while unioning accession k-mers. Inputs may be FASTA/FASTQ (optional `.gz`) or pre-counted `.kset` presence sets (see below).
+`kmat build` writes **v2** by default. Production path: stream-merge sorted `.kset` files under `--memory-gb` (see [BUILD.md](BUILD.md)). Sequence FASTA/FASTQ/`.gz` inputs remain for small tests only.
 
 ### Codec choice (locked for v2)
 

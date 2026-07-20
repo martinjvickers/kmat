@@ -58,6 +58,12 @@ struct BuildOptions {
   std::string output_path;
   /// 0 = use process runtime profile thread count.
   std::size_t num_threads{0};
+  /// Working-set budget for streaming `.kset` build. 0 → profile default (laptop 8GiB / hpc 64GiB).
+  std::size_t memory_bytes{0};
+  /// Rows per I/O flush when spilling shards (legacy-style). 0 → 100000.
+  std::size_t batch_rows{0};
+  /// Spill directory for partition shards (empty → $TMPDIR or /tmp).
+  std::string tmpdir;
 };
 
 Error build_matrix_from_sequences(const BuildOptions& opts);

@@ -11,12 +11,38 @@
 #
 # Usage (after the count array finishes):
 #   sbatch --dependency=afterok:<COUNT_JOBID> run_build.slurm
+#
+# Memory: pass ~90% of the Slurm allocation as --memory-gb so the streaming
+# builder can size partition shards. Override with MEMORY_GB=... if needed.
+
+set -euo pipefail
 
 KMAT_IMG="${KMAT_IMG:-$HOME/bin/kmat.img}"
 LIST="${LIST:-paths.txt}"
 K=31
 
 mkdir -p logs
+
+# Prefer node-local scratch for partition spills when available.
+if [ -n "${SLURM_TMPDIR:-}" ]; then
+  export TMPDIR="${SLURM_TMPDIR}"
+elif [ -d /tmp ]; then
+  export TMPDIR="${TMPDIR:-/tmp}"
+fi
+
+# Derive --memory-gb from Slurm --mem (MiB) unless MEMORY_GB is set.
+if [ -z "${MEMORY_GB:-}" ]; then
+  MEM_MB="${SLURM_MEM_PER_NODE:-0}"
+  if [ "${MEM_MB}" -gt 0 ] 2>/dev/null; then
+    # 90% of allocation, at least 1 GiB
+    MEMORY_GB=$(( MEM_MB * 90 / 100 / 1024 ))
+    if [ "${MEMORY_GB}" -lt 1 ]; then
+      MEMORY_GB=1
+    fi
+  else
+    MEMORY_GB=64
+  fi
+fi
 
 # Build a kset list in the same order as paths.txt
 : > kset_list.txt
@@ -34,7 +60,6 @@ while IFS= read -r FASTQ; do
     missing=$((missing + 1))
     continue
   fi
-  # Prefer absolute paths so singularity cwd does not matter
   echo "$(pwd)/${KSET}" >> kset_list.txt
 done < "$LIST"
 
@@ -43,8 +68,9 @@ if [ "$missing" -ne 0 ]; then
   exit 1
 fi
 
-echo "Building panel.kmat from $(wc -l < kset_list.txt) accessions"
+echo "Building panel.kmat from $(wc -l < kset_list.txt) accessions (memory_gb=${MEMORY_GB})"
 singularity exec "$KMAT_IMG" kmat --profile hpc --threads "${SLURM_CPUS_PER_TASK}" \
-  build -k "$(pwd)/kset_list.txt" -s "$K" -o "$(pwd)/panel.kmat"
+  build -k "$(pwd)/kset_list.txt" -s "$K" -o "$(pwd)/panel.kmat" \
+  --memory-gb "${MEMORY_GB}" --tmpdir "${TMPDIR}"
 
 echo "Done: $(pwd)/panel.kmat"

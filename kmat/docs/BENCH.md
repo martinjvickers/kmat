@@ -57,4 +57,12 @@ CTest smoke: `kmat_bench_laptop_tiny`, `kmat_bench_hpc_tiny` (must complete succ
 | `kmc` (default) | Production / Singularity | Calls patched `kmc` + `kmc_tools` (system zlib / `gzread`); `--threads` → KMC `-t`; spills under `--tmpdir`/`$TMPDIR` |
 | `builtin` | Tests / no KMC | In-process hashmap; fine for tiny FASTA only |
 
-Rebuild the Singularity image from the **repo root** after pulling so the patched KMC is on `PATH` inside the container.
+## Build memory (post streaming rebuild)
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--memory-gb` | laptop 8 / hpc 64 | Partition count for `.kset` streaming build |
+| `--batch-rows` | 100000 | Shard I/O flush quantum |
+| `--tmpdir` | `$TMPDIR` or `/tmp` | Spill shards (removed on success) |
+
+See [BUILD.md](BUILD.md). Rebuild the Singularity image after pulling so patched KMC + latest `kmat` are inside the container.

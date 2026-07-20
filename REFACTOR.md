@@ -23,7 +23,8 @@ No code under [`kmer_search/`](kmer_search/) is required to change while this ro
 | **1 — Core MVP** | **done** | `build`/`pop`/`gwas`/`gene`/`validate`; tiny FASTA + medium k=31/N=72 FASTQ.gz; multi-stripe; 16 ctests green |
 | **2 — Format v2 (patterns)** | **done** | Pattern store + k-mer map; GWAS-by-pattern; [`kmat/docs/FORMAT.md`](kmat/docs/FORMAT.md); 17 ctests green |
 | **3 — FASTQ count/filter** | **done** | `.kset` + build-from-kset; production count now **KMC CLI** (`--engine kmc`); builtin fallback for tests |
-| **4 — Performance** | **done** | laptop/hpc profiles; parallel build/GWAS; rolling encode; `kmat_bench` + [`kmat/docs/BENCH.md`](kmat/docs/BENCH.md); 27 ctests green |
+| **4 — Performance** | **done** | laptop/hpc profiles; parallel GWAS; rolling encode; `kmat_bench` + [`kmat/docs/BENCH.md`](kmat/docs/BENCH.md) |
+| **4b — Memory-bounded build** | **done** | streaming `.kset` merge + hash shards under `--memory-gb`; [`kmat/docs/BUILD.md`](kmat/docs/BUILD.md) |
 | **5 — UX / features** | pending | config, doctor, polish |
 
 Update this table when a phase’s “done when” criteria are met.

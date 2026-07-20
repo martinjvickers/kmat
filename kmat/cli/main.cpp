@@ -57,7 +57,8 @@ int run_import_kmers(const std::string& input, std::size_t kmer_size, const std:
   return 0;
 }
 
-int run_build(const std::string& accession_list, std::size_t kmer_size, const std::string& output) {
+int run_build(const std::string& accession_list, std::size_t kmer_size, const std::string& output,
+              double memory_gb, std::size_t batch_rows, const std::string& tmpdir) {
   std::vector<std::string> paths;
   if (auto err = kmat::read_list_file(accession_list, paths); !err.ok()) {
     return fail(err);
@@ -70,6 +71,11 @@ int run_build(const std::string& accession_list, std::size_t kmer_size, const st
   opts.kmer_size = kmer_size;
   opts.accession_paths = std::move(paths);
   opts.output_path = output;
+  opts.batch_rows = batch_rows;
+  opts.tmpdir = tmpdir;
+  if (memory_gb > 0.0) {
+    opts.memory_bytes = static_cast<std::size_t>(memory_gb * (1024.0 * 1024.0 * 1024.0));
+  }
 
   if (auto err = kmat::build_matrix_from_accessions(opts); !err.ok()) {
     return fail(err);
@@ -217,6 +223,9 @@ int main(int argc, char** argv) {
   std::string build_accession_list;
   std::size_t build_k = 31;
   std::string build_output;
+  double build_memory_gb = 0.0;
+  std::size_t build_batch_rows = 0;
+  std::string build_tmpdir;
   CLI::App* build =
       app.add_subcommand("build", "Build a PA matrix from sequences or .kset presence sets");
   build->add_option("-k,--accession-list", build_accession_list,
@@ -224,6 +233,11 @@ int main(int argc, char** argv) {
       ->required();
   build->add_option("-s,--kmer-size", build_k, "K-mer size")->required();
   build->add_option("-o,--output", build_output, "Output matrix path")->required();
+  build->add_option("--memory-gb", build_memory_gb,
+                    "Working-set budget in GiB for streaming .kset build (0=profile default)");
+  build->add_option("--batch-rows", build_batch_rows,
+                    "Rows per shard I/O flush (0=100000)");
+  build->add_option("--tmpdir", build_tmpdir, "Spill directory for build shards");
 
   CLI::App* fill = app.add_subcommand("fill", "Fill accession columns in a PA matrix");
   (void)fill;
@@ -319,7 +333,8 @@ int main(int argc, char** argv) {
     return run_import_kmers(import_input, import_k, import_output);
   }
   if (name == "build") {
-    return run_build(build_accession_list, build_k, build_output);
+    return run_build(build_accession_list, build_k, build_output, build_memory_gb, build_batch_rows,
+                     build_tmpdir);
   }
   if (name == "pop") {
     if (pop_matrix.empty() && pop_matrix_list.empty()) {
