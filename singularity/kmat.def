@@ -4,6 +4,7 @@ From: ubuntu:22.04
 # Works from anywhere — no %files / local patch tree required:
 #   sudo singularity build ~/bin/kmat.img kmat.def
 # Patches are taken from the kmat git clone below.
+# Build scratch lives under /opt/tmp (never host /tmp).
 
 %post
     set -e
@@ -12,7 +13,11 @@ From: ubuntu:22.04
         build-essential ca-certificates cmake git pkg-config python3 wget zlib1g-dev
     rm -rf /var/lib/apt/lists/*
 
+    mkdir -p /opt/tmp
+    WORK=/opt/tmp
+
     echo "cloning kmat (provides KMC patches + sources)"
+    rm -rf /opt/kmat-src
     git clone --depth 1 https://github.com/martinjvickers/kmat.git /opt/kmat-src
 
     if [ -f /opt/kmat-src/CMakeLists.txt ]; then
@@ -33,10 +38,9 @@ From: ubuntu:22.04
     # Stock release binaries fail on many real .fq.gz with:
     #   "Some error while reading gzip file"
     echo "building patched KMC 3.2.4 (system zlib + gzread)"
-    cd /tmp
-    rm -rf KMC
-    git clone --depth 1 --branch v3.2.4 https://github.com/refresh-bio/KMC.git KMC
-    cd KMC
+    rm -rf "$WORK/KMC"
+    git clone --depth 1 --branch v3.2.4 https://github.com/refresh-bio/KMC.git "$WORK/KMC"
+    cd "$WORK/KMC"
     cp -f "$PATCH_DIR/binary_reader.h" kmc_core/binary_reader.h
     python3 "$PATCH_DIR/apply-kmc-system-zlib.sh"
 
@@ -44,16 +48,16 @@ From: ubuntu:22.04
     install -m 0755 bin/kmc bin/kmc_tools /usr/local/bin/
     /usr/local/bin/kmc 2>/dev/null || true
     ldd /usr/local/bin/kmc || true
-    rm -rf /tmp/KMC
 
-    cmake -S "$SRC" -B /tmp/kmat-build \
+    cmake -S "$SRC" -B "$WORK/kmat-build" \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/usr/local \
         -DKMAT_BUILD_TESTS=OFF \
         -DKMAT_BUILD_BENCHES=OFF
-    cmake --build /tmp/kmat-build -j"$(nproc)"
-    cmake --install /tmp/kmat-build
-    rm -rf /tmp/kmat-build /opt/kmat-src
+    cmake --build "$WORK/kmat-build" -j"$(nproc)"
+    cmake --install "$WORK/kmat-build"
+
+    rm -rf /opt/kmat-src /opt/tmp
 
 %environment
     export LC_ALL=C
