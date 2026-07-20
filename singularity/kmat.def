@@ -4,12 +4,32 @@ From: ubuntu:22.04
 %post
     apt-get update
     apt-get install -y --no-install-recommends \
-        build-essential ca-certificates cmake git pkg-config zlib1g-dev
+        build-essential ca-certificates cmake git pkg-config wget zlib1g-dev
     rm -rf /var/lib/apt/lists/*
+
+    # KMC for production kmat count (disk-backed, multithreaded).
+    apt-get update
+    if apt-get install -y --no-install-recommends kmc; then
+        echo "installed kmc from apt"
+    else
+        echo "apt kmc unavailable; downloading KMC3 release binaries"
+        mkdir -p /opt/kmc /usr/local/bin
+        cd /tmp
+        wget -q https://github.com/refresh-bio/KMC/releases/download/v3.2.4/KMC3.2.4.linux.x64.tar.gz
+        tar -xzf KMC3.2.4.linux.x64.tar.gz
+        # Layout varies by release; find binaries.
+        find . -type f -name kmc -perm -111 -exec cp {} /usr/local/bin/kmc \;
+        find . -type f -name kmc_tools -perm -111 -exec cp {} /usr/local/bin/kmc_tools \;
+        chmod +x /usr/local/bin/kmc /usr/local/bin/kmc_tools
+        rm -rf /tmp/*KMC* /tmp/kmc* 2>/dev/null || true
+        rm -f /tmp/*.tar.gz 2>/dev/null || true
+    fi
+    rm -rf /var/lib/apt/lists/*
+    command -v kmc
+    command -v kmc_tools
 
     git clone --depth 1 https://github.com/martinjvickers/kmat.git /opt/kmat-src
 
-    # Repo may be either flat (CMakeLists at root) or have a kmat/ subdir
     if [ -f /opt/kmat-src/CMakeLists.txt ]; then
         SRC=/opt/kmat-src
     else
@@ -27,6 +47,7 @@ From: ubuntu:22.04
 
 %environment
     export LC_ALL=C
+    export PATH="/usr/local/bin:${PATH}"
 
 %runscript
     exec kmat "$@"

@@ -49,3 +49,12 @@ CTest smoke: `kmat_bench_laptop_tiny`, `kmat_bench_hpc_tiny` (must complete succ
 - O(K) pattern→k-mer index for GWAS hit expansion
 - Deferred `pa_bits` unless `-d/--display`
 - Larger sequential write buffers on HPC profile
+
+## Count engines (post Phase 4)
+
+| Engine | When | Notes |
+|---|---|---|
+| `kmc` (default) | Production / Singularity | Calls `kmc` + `kmc_tools`; `--threads` → KMC `-t`; spills under `--tmpdir`/`$TMPDIR` |
+| `builtin` | Tests / no KMC | In-process hashmap; fine for tiny FASTA only |
+
+Rebuild the Singularity image after pulling so KMC is on `PATH` inside the container.

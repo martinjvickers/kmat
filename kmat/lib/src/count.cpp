@@ -2,20 +2,32 @@
 
 #include "kmat/fastq.hpp"
 #include "kmat/kmer.hpp"
+#include "kmat/log.hpp"
+#include "kmat/runtime.hpp"
 #include "kmat/sequence.hpp"
 
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <limits>
+#include <sstream>
 #include <string>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
+
+namespace fs = std::filesystem;
 
 namespace kmat {
 
-Error count_kmers_to_presence_set(const CountOptions& opts) {
+namespace {
+
+Error validate_count_opts(const CountOptions& opts) {
   if (opts.input_path.empty() || opts.output_path.empty()) {
     return Error::invalid_argument("count requires input and output paths");
   }
@@ -25,7 +37,10 @@ Error count_kmers_to_presence_set(const CountOptions& opts) {
   if (opts.min_count == 0) {
     return Error::invalid_argument("min_count (--ci) must be >= 1");
   }
+  return Error::success();
+}
 
+Error count_builtin(const CountOptions& opts) {
   std::unordered_map<std::uint64_t, std::uint32_t> counts;
   counts.reserve(1 << 20);
 
@@ -53,6 +68,244 @@ Error count_kmers_to_presence_set(const CountOptions& opts) {
   std::sort(set.kmers.begin(), set.kmers.end());
   set.header.num_kmers = set.kmers.size();
   return write_presence_set(opts.output_path, set);
+}
+
+bool path_is_executable(const fs::path& p) {
+  std::error_code ec;
+  if (!fs::is_regular_file(p, ec)) {
+    return false;
+  }
+  return ::access(p.c_str(), X_OK) == 0;
+}
+
+Error run_argv(const std::vector<std::string>& args) {
+  if (args.empty()) {
+    return Error::invalid_argument("empty command");
+  }
+  std::vector<char*> argv;
+  argv.reserve(args.size() + 1);
+  for (const std::string& a : args) {
+    argv.push_back(const_cast<char*>(a.c_str()));
+  }
+  argv.push_back(nullptr);
+
+  const pid_t pid = ::fork();
+  if (pid < 0) {
+    return Error::io_error("fork failed");
+  }
+  if (pid == 0) {
+    ::execvp(argv[0], argv.data());
+    ::_exit(127);
+  }
+
+  int status = 0;
+  if (::waitpid(pid, &status, 0) < 0) {
+    return Error::io_error("waitpid failed for " + args[0]);
+  }
+  if (WIFEXITED(status)) {
+    const int code = WEXITSTATUS(status);
+    if (code == 0) {
+      return Error::success();
+    }
+    if (code == 127) {
+      return Error::io_error("executable not found or not executable: " + args[0]);
+    }
+    std::ostringstream msg;
+    msg << args[0] << " exited with status " << code;
+    return Error::io_error(msg.str());
+  }
+  return Error::io_error(args[0] + " terminated abnormally");
+}
+
+std::string scratch_root(const CountOptions& opts) {
+  if (!opts.tmpdir.empty()) {
+    return opts.tmpdir;
+  }
+  if (const char* t = std::getenv("TMPDIR")) {
+    if (*t) {
+      return t;
+    }
+  }
+  return "/tmp";
+}
+
+const char* kmc_input_flag(const std::string& path) {
+  if (path_looks_fasta(path)) {
+    return "-fm";
+  }
+  // Default FASTQ (including .fq.gz).
+  return "-fq";
+}
+
+Error dump_to_kset(const std::string& dump_path, const CountOptions& opts) {
+  std::ifstream in(dump_path);
+  if (!in) {
+    return Error::io_error("failed to open KMC dump: " + dump_path);
+  }
+
+  PresenceSet set;
+  set.header.kmer_size = static_cast<std::uint32_t>(opts.kmer_size);
+  set.header.min_count = opts.min_count;
+  set.kmers.reserve(1 << 20);
+
+  std::string line;
+  while (std::getline(in, line)) {
+    if (!line.empty() && line.back() == '\r') {
+      line.pop_back();
+    }
+    if (line.empty()) {
+      continue;
+    }
+    // Format: KMER<tab>COUNT  or  KMER COUNT
+    std::string kmer;
+    std::size_t i = 0;
+    while (i < line.size() && !std::isspace(static_cast<unsigned char>(line[i]))) {
+      kmer.push_back(line[i]);
+      ++i;
+    }
+    if (kmer.size() != opts.kmer_size) {
+      return Error::invalid_argument("KMC dump k-mer length mismatch: " + kmer);
+    }
+    std::uint64_t code = 0;
+    if (auto err = encode_kmer(kmer, code); !err.ok()) {
+      return err;
+    }
+    set.kmers.push_back(code);
+  }
+
+  std::sort(set.kmers.begin(), set.kmers.end());
+  set.kmers.erase(std::unique(set.kmers.begin(), set.kmers.end()), set.kmers.end());
+  set.header.num_kmers = set.kmers.size();
+  return write_presence_set(opts.output_path, set);
+}
+
+Error count_kmc(const CountOptions& opts) {
+  std::string kmc_bin = opts.kmc_bin.empty() ? "kmc" : opts.kmc_bin;
+  std::string kmc_tools_bin = opts.kmc_tools_bin.empty() ? "kmc_tools" : opts.kmc_tools_bin;
+  std::string resolved_kmc;
+  std::string resolved_tools;
+  if (!find_executable(kmc_bin, resolved_kmc)) {
+    return Error::io_error(
+        "kmc not found on PATH (install KMC or use --engine builtin). Looked for: " + kmc_bin);
+  }
+  if (!find_executable(kmc_tools_bin, resolved_tools)) {
+    return Error::io_error(
+        "kmc_tools not found on PATH (install KMC or use --engine builtin). Looked for: " +
+        kmc_tools_bin);
+  }
+
+  const std::size_t threads =
+      opts.num_threads > 0 ? opts.num_threads : effective_threads(runtime_config());
+
+  const fs::path root = fs::path(scratch_root(opts)) / ("kmat_kmc_" + std::to_string(::getpid()));
+  std::error_code ec;
+  fs::create_directories(root, ec);
+  if (ec) {
+    return Error::io_error("failed to create KMC work dir: " + root.string());
+  }
+
+  const fs::path db_prefix = root / "db";
+  const fs::path work = root / "work";
+  const fs::path dump = root / "dump.txt";
+  fs::create_directories(work, ec);
+
+  // RAII cleanup of scratch.
+  struct Cleaner {
+    fs::path path;
+    ~Cleaner() {
+      std::error_code ignore;
+      fs::remove_all(path, ignore);
+    }
+  } cleaner{root};
+
+  std::ostringstream tflag;
+  tflag << "-t" << threads;
+  std::ostringstream kflag;
+  kflag << "-k" << opts.kmer_size;
+  std::ostringstream ciflag;
+  ciflag << "-ci" << opts.min_count;
+  // Cap counters at min_count — enough for presence after -ci filter; saves RAM in KMC.
+  std::ostringstream csflag;
+  csflag << "-cs" << opts.min_count;
+
+  log_info("KMC count: " + resolved_kmc + " " + kflag.str() + " " + ciflag.str() + " " +
+           tflag.str());
+
+  {
+    std::vector<std::string> args = {
+        resolved_kmc,       "-hp",         kflag.str(), ciflag.str(), csflag.str(), tflag.str(),
+        kmc_input_flag(opts.input_path), opts.input_path, db_prefix.string(), work.string()};
+    if (auto err = run_argv(args); !err.ok()) {
+      return err;
+    }
+  }
+
+  // Prefer modern "transform … dump -s"; fall back to "dump -s".
+  {
+    std::vector<std::string> args = {resolved_tools, "-hp", "transform", db_prefix.string(),
+                                     "dump", "-s", dump.string()};
+    if (auto err = run_argv(args); !err.ok()) {
+      std::vector<std::string> alt = {resolved_tools, "-hp", "dump", "-s", db_prefix.string(),
+                                      dump.string()};
+      if (auto err2 = run_argv(alt); !err2.ok()) {
+        return Error::io_error("kmc_tools dump failed (" + err.message + "; fallback: " +
+                               err2.message + ")");
+      }
+    }
+  }
+
+  return dump_to_kset(dump.string(), opts);
+}
+
+}  // namespace
+
+bool find_executable(const std::string& name, std::string& resolved_path) {
+  resolved_path.clear();
+  if (name.empty()) {
+    return false;
+  }
+  const fs::path as_path(name);
+  if (as_path.is_absolute() || name.find('/') != std::string::npos) {
+    if (path_is_executable(as_path)) {
+      resolved_path = as_path.string();
+      return true;
+    }
+    return false;
+  }
+
+  const char* path_env = std::getenv("PATH");
+  if (path_env == nullptr) {
+    return false;
+  }
+  std::string path = path_env;
+  std::size_t start = 0;
+  while (start <= path.size()) {
+    const std::size_t end = path.find(':', start);
+    const std::string dir =
+        path.substr(start, end == std::string::npos ? std::string::npos : end - start);
+    if (!dir.empty()) {
+      const fs::path candidate = fs::path(dir) / name;
+      if (path_is_executable(candidate)) {
+        resolved_path = candidate.string();
+        return true;
+      }
+    }
+    if (end == std::string::npos) {
+      break;
+    }
+    start = end + 1;
+  }
+  return false;
+}
+
+Error count_kmers_to_presence_set(const CountOptions& opts) {
+  if (auto err = validate_count_opts(opts); !err.ok()) {
+    return err;
+  }
+  if (opts.engine == CountEngine::Builtin) {
+    return count_builtin(opts);
+  }
+  return count_kmc(opts);
 }
 
 Error import_kmers_text_to_presence_set(const ImportKmersOptions& opts) {

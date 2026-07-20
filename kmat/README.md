@@ -10,6 +10,7 @@ For **HPC / Singularity / Slurm** (count ~100 FASTQ.gz → matrix), see [`../hpc
 - C++17 compiler (Apple Clang, GCC, or Clang)
 - zlib (system / Homebrew)
 - Git (FetchContent: CLI11, Catch2, Eigen)
+- For production `count --engine kmc`: `kmc` and `kmc_tools` on `PATH` (bundled in Singularity image)
 
 ## Build (macOS / Linux)
 
@@ -62,12 +63,19 @@ mkdir -p "$OUT"
 
 ### Count then build (HPC-friendly)
 
+Production path uses **KMC** (`--engine kmc`, default). Needs `kmc` + `kmc_tools` on `PATH` (Singularity image includes them). For tiny local tests without KMC, use `--engine builtin`.
+
 ```bash
 TD=testdata
 OUT=/tmp/kmat_count
 mkdir -p "$OUT/ksets"
 
-./build/cli/kmat count -i "$TD/accessions/sample_a.fasta" -s 3 --ci 1 -o "$OUT/ksets/sample_a.kset"
+./build/cli/kmat --threads 8 count --engine builtin \
+  -i "$TD/accessions/sample_a.fasta" -s 3 --ci 1 -o "$OUT/ksets/sample_a.kset"
+# production / Singularity:
+# ./build/cli/kmat --profile hpc --threads 8 count --engine kmc --tmpdir "$TMPDIR" \
+#   -i acc.fq.gz -s 31 --ci 2 -o acc.kset
+
 ./build/cli/kmat build -k "$OUT/kset_list.txt" -s 3 -o "$OUT/panel.kmat"
 ```
 
@@ -89,7 +97,7 @@ mkdir -p "$OUT"
 
 | Command | Status |
 |---|---|
-| `count` | FASTQ/FASTA → filtered `.kset` (`--ci`) |
+| `count` | FASTQ/FASTA → `.kset` via **KMC** (`--engine kmc`) or builtin hashmap |
 | `import-kmers` | Text k-mer list → `.kset` (no KMC link) |
 | `build` | PA matrix from sequences or `.kset` (parallel ingest) |
 | `pop` | PCA population-structure TSV |

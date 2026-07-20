@@ -22,7 +22,7 @@ No code under [`kmer_search/`](kmer_search/) is required to change while this ro
 | **0 — Skeleton** | **done** | CMake, CLI11, lib encode/decode, tests, no SeqAn |
 | **1 — Core MVP** | **done** | `build`/`pop`/`gwas`/`gene`/`validate`; tiny FASTA + medium k=31/N=72 FASTQ.gz; multi-stripe; 16 ctests green |
 | **2 — Format v2 (patterns)** | **done** | Pattern store + k-mer map; GWAS-by-pattern; [`kmat/docs/FORMAT.md`](kmat/docs/FORMAT.md); 17 ctests green |
-| **3 — FASTQ count/filter** | **done** | `count --ci` → `.kset`; `build` from `.kset`; `import-kmers` (no KMC link); 21 ctests green |
+| **3 — FASTQ count/filter** | **done** | `.kset` + build-from-kset; production count now **KMC CLI** (`--engine kmc`); builtin fallback for tests |
 | **4 — Performance** | **done** | laptop/hpc profiles; parallel build/GWAS; rolling encode; `kmat_bench` + [`kmat/docs/BENCH.md`](kmat/docs/BENCH.md); 27 ctests green |
 | **5 — UX / features** | pending | config, doctor, polish |
 
@@ -47,7 +47,7 @@ Update this table when a phase’s “done when” criteria are met.
 - Friendly CLI/UX (consistent flags, progress, validation).
 - Maximum practical performance: deduplicate work and bytes before buying hardware.
 - Scale: 1000s of accessions; wheat-scale matrices (~15B 31-mers, multi-TB) without linear waste on duplicate PA rows.
-- Drop KMC and SeqAn as required dependencies; optional KMC **import** only for migration.
+- Drop SeqAn as a required dependency. **KMC is required for production `kmat count`** (invoked as CLI binaries, not linked); matrix/GWAS remain KMC-free. `--engine builtin` covers small local tests without KMC.
 - Portable builds: **macOS and Linux** as first-class platforms.
 
 ### Non-goals (especially early phases)
@@ -296,8 +296,8 @@ Status values: `idea` | `planned` | `in-phase-N` | `done`.
 |---|---|---|---|
 | F1 | Single `kmat` CLI (CLI11, no SeqAn) | done | Phase 0–1 |
 | F2 | Pattern-compressed matrix + GWAS-by-pattern | done | Phase 2; v2 default from `build` |
-| F3 | FASTQ-native count/filter ingest | done | Phase 3; `kmat count --ci` → `.kset` |
-| F4 | Optional KMC import for migration | done | Phase 3; `import-kmers` text dump → `.kset` (no KMC link) |
+| F3 | FASTQ-native count/filter ingest | done | Phase 3; production count uses KMC CLI → `.kset` |
+| F4 | Optional KMC import for migration | done | Phase 3; `import-kmers` + **`count --engine kmc`** (CLI, not linked) |
 | F5 | Laptop vs HPC runtime profiles | done | Phase 4; `--profile` / `--threads` |
 | F6 | `kmat validate` / `doctor` | done | Phase 1 validate; doctor later |
 | F7 | Config file for recurring panel paths | idea | Phase 5 |

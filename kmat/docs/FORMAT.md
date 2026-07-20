@@ -86,6 +86,8 @@ Per-accession filtered k-mer presence set produced by `kmat count` (or `kmat imp
 
 `kmat build` detects `.kset` paths in the accession list and unions them into a v2 matrix (same list order as GWAS columns). Do not mix `.kset` and sequence paths in one list.
 
+Production `.kset` files are usually produced by `kmat count --engine kmc` (KMC CLI → dump → encode). `--engine builtin` is for small fixtures only.
+
 ---
 
 ## In-memory model

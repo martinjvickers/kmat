@@ -22,6 +22,6 @@ ctest --test-dir build --output-on-failure
 ## HPC
 
 ```bash
-sudo singularity build kmat.img singularity/kmat.def
-# then see hpc/README.md
+sudo singularity build ~/bin/kmat.img singularity/kmat.def   # includes KMC + kmat
+# then see hpc/README.md — count uses KMC (--engine kmc)
 ```

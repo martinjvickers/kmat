@@ -1,21 +1,24 @@
-# Simple Slurm usage (no binds, no repo scripts required at runtime)
+# Simple Slurm usage (no binds)
 
-Copy these two files next to your `paths.txt`:
+Production `kmat count` uses **KMC** inside the Singularity image (`--engine kmc`).
+Copy these next to `paths.txt`:
 
-- `run_count.slurm` — one array task per accession → `ksets/*.kset`
-- `run_build.slurm` — union into `panel.kmat`
+- `run_count.slurm` — array → `ksets/*.kset` (KMC, multithreaded)
+- `run_build.slurm` — union → `panel.kmat`
 
 ```bash
-cd /path/to/testing_kmat          # has paths.txt
+cd /path/to/testing_kmat
 mkdir -p logs ksets
 
-# copy the .slurm files here, then:
 N=$(grep -vE '^\s*(#|$)' paths.txt | wc -l)
-sbatch --array=1-${N}%50 run_count.slurm
-
-# when that job finishes (note the job id from sbatch):
-sbatch --dependency=afterok:JOBID run_build.slurm
+COUNT=$(sbatch --parsable --array=1-${N}%50 run_count.slurm)
+sbatch --dependency=afterok:${COUNT} run_build.slurm
 ```
 
-Defaults: image `$HOME/bin/kmat.img`, list `paths.txt`, `-s 31 --ci 2`.
-Override if needed: `sbatch --export=ALL,KMAT_IMG=...,LIST=... ...`
+Defaults: `$HOME/bin/kmat.img`, `paths.txt`, `-s 31 --ci 2`, `--cpus-per-task=8` for KMC `-t`.
+
+Rebuild the image after pulling so it includes KMC + the KMC-backed count path:
+
+```bash
+sudo singularity build ~/bin/kmat.img singularity/kmat.def
+```

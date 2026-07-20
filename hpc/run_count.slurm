@@ -3,15 +3,16 @@
 #SBATCH --output=logs/count_%A_%a.out
 #SBATCH --error=logs/count_%A_%a.err
 #SBATCH --array=1-440%50
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=12:00:00
 #
 # Count k-mers for each accession in paths.txt (one array task per line).
+# Uses KMC inside the Singularity image (multithreaded via --threads).
 #
 # Usage (from the directory that contains paths.txt):
 #   mkdir -p logs ksets
-#   N=$(grep -cve '^\s*#' -e '^\s*$' paths.txt)   # or: wc -l < paths.txt
+#   N=$(grep -vE '^\s*(#|$)' paths.txt | wc -l)
 #   sbatch --array=1-${N}%50 run_count.slurm
 
 KMAT_IMG="${KMAT_IMG:-$HOME/bin/kmat.img}"
@@ -36,5 +37,13 @@ STEM=${STEM%.fastq}
 OUT="ksets/${STEM}.kset"
 echo "task=${SLURM_ARRAY_TASK_ID}  $FASTQ  ->  $OUT"
 
-singularity exec "$KMAT_IMG" kmat count \
+# Prefer node-local scratch for KMC spill files when available.
+if [ -n "${SLURM_TMPDIR:-}" ]; then
+  export TMPDIR="${SLURM_TMPDIR}"
+elif [ -d /tmp ]; then
+  export TMPDIR="${TMPDIR:-/tmp}"
+fi
+
+singularity exec "$KMAT_IMG" kmat --profile hpc --threads "${SLURM_CPUS_PER_TASK}" \
+  count --engine kmc --tmpdir "${TMPDIR}" \
   -i "$FASTQ" -s "$K" --ci "$CI" -o "$OUT"

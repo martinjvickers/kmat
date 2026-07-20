@@ -22,12 +22,22 @@ int fail(const kmat::Error& err) {
 }
 
 int run_count(const std::string& input, std::size_t kmer_size, std::uint32_t min_count,
-              const std::string& output) {
+              const std::string& output, const std::string& engine_name, const std::string& tmpdir) {
   kmat::CountOptions opts;
   opts.input_path = input;
   opts.output_path = output;
   opts.kmer_size = kmer_size;
   opts.min_count = min_count;
+  opts.tmpdir = tmpdir;
+  opts.num_threads = 0;  // use runtime profile
+  if (engine_name == "builtin") {
+    opts.engine = kmat::CountEngine::Builtin;
+  } else if (engine_name == "kmc") {
+    opts.engine = kmat::CountEngine::Kmc;
+  } else {
+    std::cerr << "error: --engine must be kmc or builtin\n";
+    return 1;
+  }
   if (auto err = kmat::count_kmers_to_presence_set(opts); !err.ok()) {
     return fail(err);
   }
@@ -184,11 +194,16 @@ int main(int argc, char** argv) {
   std::size_t count_k = 31;
   std::uint32_t count_ci = 1;
   std::string count_output;
+  std::string count_engine = "kmc";
+  std::string count_tmpdir;
   CLI::App* count = app.add_subcommand("count", "Count/filter k-mers from FASTQ/FASTA into a .kset");
   count->add_option("-i,--input", count_input, "Input FASTQ/FASTA (optional .gz)")->required();
   count->add_option("-s,--kmer-size", count_k, "K-mer size")->required();
   count->add_option("--ci", count_ci, "Minimum k-mer count (KMC-style -ci)")->default_val(1);
   count->add_option("-o,--output", count_output, "Output .kset presence set")->required();
+  count->add_option("--engine", count_engine, "Count engine: kmc (default) or builtin")
+      ->default_val("kmc");
+  count->add_option("--tmpdir", count_tmpdir, "Scratch directory for KMC (default: $TMPDIR)");
 
   std::string import_input;
   std::size_t import_k = 31;
@@ -298,7 +313,7 @@ int main(int argc, char** argv) {
   const std::string name = sub->get_name();
 
   if (name == "count") {
-    return run_count(count_input, count_k, count_ci, count_output);
+    return run_count(count_input, count_k, count_ci, count_output, count_engine, count_tmpdir);
   }
   if (name == "import-kmers") {
     return run_import_kmers(import_input, import_k, import_output);

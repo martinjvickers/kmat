@@ -27,6 +27,20 @@ target_compile_options(kmat_tests
 
 catch_discover_tests(kmat_tests)
 
+# Optional: run hidden [kmc] smoke when binaries are on PATH.
+find_program(KMAT_KMC_EXECUTABLE kmc)
+find_program(KMAT_KMC_TOOLS_EXECUTABLE kmc_tools)
+if(KMAT_KMC_EXECUTABLE AND KMAT_KMC_TOOLS_EXECUTABLE)
+  add_test(
+    NAME kmat_kmc_count_smoke
+    COMMAND kmat_tests "[kmc]"
+  )
+  set_tests_properties(kmat_kmc_count_smoke PROPERTIES
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    LABELS "kmc"
+  )
+endif()
+
 # Shell integration smoke test (optional manual parity check).
 add_test(
   NAME kmat_cli_pipeline

@@ -57,6 +57,7 @@ TEST_CASE("count --ci filters low-abundance k-mers", "[count]") {
   opts.output_path = kset1.string();
   opts.kmer_size = 3;
   opts.min_count = 1;
+  opts.engine = kmat::CountEngine::Builtin;
   REQUIRE(kmat::count_kmers_to_presence_set(opts).ok());
 
   kmat::PresenceSet all;
@@ -115,6 +116,7 @@ TEST_CASE("count then build matches direct sequence build at --ci 1", "[count][m
     copts.output_path = out.string();
     copts.kmer_size = 3;
     copts.min_count = 1;
+    copts.engine = kmat::CountEngine::Builtin;
     REQUIRE(kmat::count_kmers_to_presence_set(copts).ok());
     kset_paths.push_back(out.string());
   }
@@ -145,4 +147,35 @@ TEST_CASE("count then build matches direct sequence build at --ci 1", "[count][m
     REQUIRE(m1.kmers[i].kmer_code == m2.kmers[i].kmer_code);
     REQUIRE(m1.patterns[m1.kmers[i].pattern_id] == m2.patterns[m2.kmers[i].pattern_id]);
   }
+}
+
+TEST_CASE("KMC engine counts FASTA when kmc is installed", "[.][kmc][count]") {
+  std::string kmc_path;
+  std::string tools_path;
+  if (!kmat::find_executable("kmc", kmc_path) || !kmat::find_executable("kmc_tools", tools_path)) {
+    WARN("kmc/kmc_tools not on PATH; not running KMC count smoke");
+    return;
+  }
+
+  const fs::path dir = tmp_dir("count_kmc");
+  const fs::path fasta = dir / "acc.fa";
+  {
+    std::ofstream out(fasta);
+    out << ">acc\nACGTACGTACGTACGTACGTACGTACGTA\n";
+  }
+
+  kmat::CountOptions opts;
+  opts.input_path = fasta.string();
+  opts.output_path = (dir / "acc.kset").string();
+  opts.kmer_size = 5;
+  opts.min_count = 1;
+  opts.engine = kmat::CountEngine::Kmc;
+  opts.tmpdir = dir.string();
+  opts.num_threads = 2;
+  REQUIRE(kmat::count_kmers_to_presence_set(opts).ok());
+
+  kmat::PresenceSet set;
+  REQUIRE(kmat::read_presence_set(opts.output_path, set).ok());
+  REQUIRE(set.header.kmer_size == 5);
+  REQUIRE(set.kmers.size() >= 1);
 }
