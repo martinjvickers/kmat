@@ -10,6 +10,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -78,7 +79,7 @@ bool path_is_executable(const fs::path& p) {
   return ::access(p.c_str(), X_OK) == 0;
 }
 
-Error run_argv(const std::vector<std::string>& args) {
+Error run_argv(const std::vector<std::string>& args, const std::string& stderr_path = {}) {
   if (args.empty()) {
     return Error::invalid_argument("empty command");
   }
@@ -94,6 +95,13 @@ Error run_argv(const std::vector<std::string>& args) {
     return Error::io_error("fork failed");
   }
   if (pid == 0) {
+    if (!stderr_path.empty()) {
+      const int fd = ::open(stderr_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+      if (fd >= 0) {
+        ::dup2(fd, STDERR_FILENO);
+        ::close(fd);
+      }
+    }
     ::execvp(argv[0], argv.data());
     ::_exit(127);
   }
@@ -112,6 +120,19 @@ Error run_argv(const std::vector<std::string>& args) {
     }
     std::ostringstream msg;
     msg << args[0] << " exited with status " << code;
+    if (!stderr_path.empty()) {
+      std::ifstream err_in(stderr_path);
+      std::string err_line;
+      std::string tail;
+      while (std::getline(err_in, err_line)) {
+        if (!err_line.empty()) {
+          tail = err_line;
+        }
+      }
+      if (!tail.empty()) {
+        msg << " (" << tail << ")";
+      }
+    }
     return Error::io_error(msg.str());
   }
   return Error::io_error(args[0] + " terminated abnormally");
@@ -133,7 +154,7 @@ const char* kmc_input_flag(const std::string& path) {
   if (path_looks_fasta(path)) {
     return "-fm";
   }
-  // Default FASTQ (including .fq.gz).
+  // Default FASTQ (including .fq.gz / .fastq.gz — KMC reads gzip natively).
   return "-fq";
 }
 
@@ -180,18 +201,43 @@ Error dump_to_kset(const std::string& dump_path, const CountOptions& opts) {
 }
 
 Error count_kmc(const CountOptions& opts) {
-  std::string kmc_bin = opts.kmc_bin.empty() ? "kmc" : opts.kmc_bin;
-  std::string kmc_tools_bin = opts.kmc_tools_bin.empty() ? "kmc_tools" : opts.kmc_tools_bin;
+  // Prefer upstream binaries shipped in /usr/local/bin (Singularity image). Distro
+  // /usr/bin/kmc packages are often broken on .fq.gz ("Some error while reading gzip file").
+  std::string kmc_bin = opts.kmc_bin;
+  std::string kmc_tools_bin = opts.kmc_tools_bin;
+  if (kmc_bin.empty()) {
+    if (path_is_executable("/usr/local/bin/kmc")) {
+      kmc_bin = "/usr/local/bin/kmc";
+    } else {
+      kmc_bin = "kmc";
+    }
+  }
+  if (kmc_tools_bin.empty()) {
+    if (path_is_executable("/usr/local/bin/kmc_tools")) {
+      kmc_tools_bin = "/usr/local/bin/kmc_tools";
+    } else {
+      kmc_tools_bin = "kmc_tools";
+    }
+  }
+
   std::string resolved_kmc;
   std::string resolved_tools;
   if (!find_executable(kmc_bin, resolved_kmc)) {
     return Error::io_error(
-        "kmc not found on PATH (install KMC or use --engine builtin). Looked for: " + kmc_bin);
+        "kmc not found on PATH (install upstream KMC 3.x into the image, or use --engine "
+        "builtin). Looked for: " +
+        kmc_bin);
   }
   if (!find_executable(kmc_tools_bin, resolved_tools)) {
     return Error::io_error(
-        "kmc_tools not found on PATH (install KMC or use --engine builtin). Looked for: " +
+        "kmc_tools not found on PATH (install upstream KMC 3.x into the image, or use "
+        "--engine builtin). Looked for: " +
         kmc_tools_bin);
+  }
+  if (resolved_kmc == "/usr/bin/kmc") {
+    log_info(
+        "warning: using /usr/bin/kmc (often lacks working gzip support); prefer upstream "
+        "KMC in /usr/local/bin from singularity/kmat.def");
   }
 
   const std::size_t threads =
@@ -207,9 +253,11 @@ Error count_kmc(const CountOptions& opts) {
   const fs::path db_prefix = root / "db";
   const fs::path work = root / "work";
   const fs::path dump = root / "dump.txt";
+  const fs::path kmc_err = root / "kmc.err";
+  const fs::path tools_err = root / "kmc_tools.err";
   fs::create_directories(work, ec);
 
-  // RAII cleanup of scratch.
+  // RAII cleanup of scratch (KMC spill + dump only — never stages decompressed FASTQ).
   struct Cleaner {
     fs::path path;
     ~Cleaner() {
@@ -218,36 +266,39 @@ Error count_kmc(const CountOptions& opts) {
     }
   } cleaner{root};
 
+  const char* format_flag = kmc_input_flag(opts.input_path);
+
   std::ostringstream tflag;
   tflag << "-t" << threads;
   std::ostringstream kflag;
   kflag << "-k" << opts.kmer_size;
   std::ostringstream ciflag;
   ciflag << "-ci" << opts.min_count;
-  // Cap counters at min_count — enough for presence after -ci filter; saves RAM in KMC.
   std::ostringstream csflag;
   csflag << "-cs" << opts.min_count;
 
   log_info("KMC count: " + resolved_kmc + " " + kflag.str() + " " + ciflag.str() + " " +
-           tflag.str());
+           tflag.str() + " " + format_flag + " " + opts.input_path);
 
   {
-    std::vector<std::string> args = {
-        resolved_kmc,       "-hp",         kflag.str(), ciflag.str(), csflag.str(), tflag.str(),
-        kmc_input_flag(opts.input_path), opts.input_path, db_prefix.string(), work.string()};
-    if (auto err = run_argv(args); !err.ok()) {
+    // Pass .fq.gz / .fastq.gz straight through — upstream KMC reads gzip natively.
+    std::vector<std::string> args = {resolved_kmc,       "-hp",
+                                     kflag.str(),        ciflag.str(),
+                                     csflag.str(),       tflag.str(),
+                                     format_flag,        opts.input_path,
+                                     db_prefix.string(), work.string()};
+    if (auto err = run_argv(args, kmc_err.string()); !err.ok()) {
       return err;
     }
   }
 
-  // Prefer modern "transform … dump -s"; fall back to "dump -s".
   {
     std::vector<std::string> args = {resolved_tools, "-hp", "transform", db_prefix.string(),
                                      "dump", "-s", dump.string()};
-    if (auto err = run_argv(args); !err.ok()) {
+    if (auto err = run_argv(args, tools_err.string()); !err.ok()) {
       std::vector<std::string> alt = {resolved_tools, "-hp", "dump", "-s", db_prefix.string(),
                                       dump.string()};
-      if (auto err2 = run_argv(alt); !err2.ok()) {
+      if (auto err2 = run_argv(alt, tools_err.string()); !err2.ok()) {
         return Error::io_error("kmc_tools dump failed (" + err.message + "; fallback: " +
                                err2.message + ")");
       }

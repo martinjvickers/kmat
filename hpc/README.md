@@ -17,8 +17,10 @@ sbatch --dependency=afterok:${COUNT} run_build.slurm
 
 Defaults: `$HOME/bin/kmat.img`, `paths.txt`, `-s 31 --ci 2`, `--cpus-per-task=8` for KMC `-t`.
 
-Rebuild the image after pulling so it includes KMC + the KMC-backed count path:
+KMC reads `.fq.gz` natively. The image must ship **upstream** KMC under `/usr/local/bin` (not the Debian `/usr/bin/kmc` package, which often fails with “Some error while reading gzip file”).
 
 ```bash
 sudo singularity build ~/bin/kmat.img singularity/kmat.def
+# verify:
+singularity exec ~/bin/kmat.img which kmc    # expect /usr/local/bin/kmc
 ```

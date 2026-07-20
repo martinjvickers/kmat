@@ -7,26 +7,32 @@ From: ubuntu:22.04
         build-essential ca-certificates cmake git pkg-config wget zlib1g-dev
     rm -rf /var/lib/apt/lists/*
 
-    # KMC for production kmat count (disk-backed, multithreaded).
-    apt-get update
-    if apt-get install -y --no-install-recommends kmc; then
-        echo "installed kmc from apt"
-    else
-        echo "apt kmc unavailable; downloading KMC3 release binaries"
-        mkdir -p /opt/kmc /usr/local/bin
-        cd /tmp
-        wget -q https://github.com/refresh-bio/KMC/releases/download/v3.2.4/KMC3.2.4.linux.x64.tar.gz
-        tar -xzf KMC3.2.4.linux.x64.tar.gz
-        # Layout varies by release; find binaries.
-        find . -type f -name kmc -perm -111 -exec cp {} /usr/local/bin/kmc \;
-        find . -type f -name kmc_tools -perm -111 -exec cp {} /usr/local/bin/kmc_tools \;
-        chmod +x /usr/local/bin/kmc /usr/local/bin/kmc_tools
-        rm -rf /tmp/*KMC* /tmp/kmc* 2>/dev/null || true
-        rm -f /tmp/*.tar.gz 2>/dev/null || true
+    # Upstream KMC only — do NOT apt-install kmc (distro builds often break on .fq.gz).
+    echo "installing upstream KMC 3.2.4"
+    mkdir -p /usr/local/bin
+    cd /tmp
+    wget -O KMC3.2.4.linux.x64.tar.gz \
+      https://github.com/refresh-bio/KMC/releases/download/v3.2.4/KMC3.2.4.linux.x64.tar.gz
+    tar -xzf KMC3.2.4.linux.x64.tar.gz
+    KMC_BIN=$(find /tmp -type f -name kmc ! -name '*.*' | head -n 1)
+    TOOLS_BIN=$(find /tmp -type f -name kmc_tools ! -name '*.*' | head -n 1)
+    if [ -z "$KMC_BIN" ] || [ -z "$TOOLS_BIN" ]; then
+        echo "ERROR: kmc/kmc_tools not found in release tarball" >&2
+        find /tmp -maxdepth 3 -type f | head -50 >&2
+        exit 1
     fi
-    rm -rf /var/lib/apt/lists/*
-    command -v kmc
-    command -v kmc_tools
+    cp -f "$KMC_BIN" /usr/local/bin/kmc
+    cp -f "$TOOLS_BIN" /usr/local/bin/kmc_tools
+    chmod +x /usr/local/bin/kmc /usr/local/bin/kmc_tools
+    rm -rf /tmp/KMC3.2.4.linux.x64.tar.gz
+    find /tmp -maxdepth 2 -type d -name 'kmc*' -exec rm -rf {} + 2>/dev/null || true
+    find /tmp -maxdepth 2 -type d -name 'bin' -exec rm -rf {} + 2>/dev/null || true
+    /usr/local/bin/kmc 2>/dev/null || true
+    ls -la /usr/local/bin/kmc /usr/local/bin/kmc_tools
+    # Ensure apt kmc is not present / not preferred
+    if [ -e /usr/bin/kmc ] && [ ! -L /usr/bin/kmc ]; then
+        echo "NOTE: /usr/bin/kmc exists; PATH prefers /usr/local/bin"
+    fi
 
     git clone --depth 1 https://github.com/martinjvickers/kmat.git /opt/kmat-src
 
