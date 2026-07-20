@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -177,6 +178,61 @@ TEST_CASE("streaming build medium panel under constrained memory", "[matrix][bui
   REQUIRE(kmat::read_matrix(b.string(), m2).ok());
   REQUIRE(matrices_semantically_equal(m1, m2));
   REQUIRE(m1.header.num_accessions == n);
+
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+}
+
+TEST_CASE("hierarchical merge matches direct merge under tiny FD budget", "[matrix][build]") {
+  const fs::path td = fs::path(KMAT_TESTDATA_DIR);
+  const fs::path dir = tmp_dir("hier");
+  const fs::path spill = dir / "spill";
+  fs::create_directories(spill);
+
+  std::vector<std::string> fasta_paths;
+  REQUIRE(kmat::read_list_file((td / "accession_list.txt").string(), fasta_paths).ok());
+  REQUIRE(kmat::resolve_list_paths((td / "accession_list.txt").string(), fasta_paths).ok());
+
+  std::vector<std::string> kset_paths;
+  for (const std::string& fa : fasta_paths) {
+    const std::string id = kmat::accession_id_from_path(fa);
+    const fs::path out = dir / (id + ".kset");
+    kmat::CountOptions copts;
+    copts.input_path = fa;
+    copts.output_path = out.string();
+    copts.kmer_size = 3;
+    copts.min_count = 1;
+    copts.engine = kmat::CountEngine::Builtin;
+    REQUIRE(kmat::count_kmers_to_presence_set(copts).ok());
+    kset_paths.push_back(out.string());
+  }
+
+  const fs::path direct = dir / "direct.kmat";
+  const fs::path hier = dir / "hier.kmat";
+
+  kmat::BuildOptions o1;
+  o1.kmer_size = 3;
+  o1.accession_paths = kset_paths;
+  o1.output_path = direct.string();
+  o1.memory_bytes = 64ull << 20;
+  o1.batch_rows = 16;
+  o1.tmpdir = spill.string();
+  o1.num_threads = 2;
+  unsetenv("KMAT_BUILD_MAX_OPEN");
+  REQUIRE(kmat::build_matrix_from_accessions(o1).ok());
+
+  // Force hierarchical accession merge (group size 2) regardless of ulimit.
+  REQUIRE(setenv("KMAT_BUILD_MAX_OPEN", "2", 1) == 0);
+  kmat::BuildOptions o2 = o1;
+  o2.output_path = hier.string();
+  REQUIRE(kmat::build_matrix_from_accessions(o2).ok());
+  unsetenv("KMAT_BUILD_MAX_OPEN");
+
+  kmat::PaMatrix m1;
+  kmat::PaMatrix m2;
+  REQUIRE(kmat::read_matrix(direct.string(), m1).ok());
+  REQUIRE(kmat::read_matrix(hier.string(), m2).ok());
+  REQUIRE(matrices_semantically_equal(m1, m2));
 
   std::error_code ec;
   fs::remove_all(dir, ec);

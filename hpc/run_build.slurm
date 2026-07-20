@@ -14,12 +14,20 @@
 #
 # Memory: pass ~90% of the Slurm allocation as --memory-gb so the streaming
 # builder can size partition shards. Override with MEMORY_GB=... if needed.
+#
+# IMPORTANT: keep `singularity exec ... kmat ... build` as ONE command.
+# Do not comment out only the first line — a bare `build` is not a shell command.
 
 set -euo pipefail
 
 KMAT_IMG="${KMAT_IMG:-$HOME/bin/kmat.img}"
 LIST="${LIST:-paths.txt}"
 K=31
+THREADS="${SLURM_CPUS_PER_TASK:-16}"
+
+# Soft nofile is often 1024; kmat also raises soft→hard, and hierarchical-merges
+# if N still exceeds the budget. Raising here helps large panels (1000s of .kset).
+ulimit -n 65536 2>/dev/null || true
 
 mkdir -p logs
 
@@ -29,6 +37,7 @@ if [ -n "${SLURM_TMPDIR:-}" ]; then
 elif [ -d /tmp ]; then
   export TMPDIR="${TMPDIR:-/tmp}"
 fi
+mkdir -p "${TMPDIR}"
 
 # Derive --memory-gb from Slurm --mem (MiB) unless MEMORY_GB is set.
 if [ -z "${MEMORY_GB:-}" ]; then
@@ -68,8 +77,8 @@ if [ "$missing" -ne 0 ]; then
   exit 1
 fi
 
-echo "Building panel.kmat from $(wc -l < kset_list.txt) accessions (memory_gb=${MEMORY_GB})"
-singularity exec "$KMAT_IMG" kmat --profile hpc --threads "${SLURM_CPUS_PER_TASK}" \
+echo "Building panel.kmat from $(wc -l < kset_list.txt) accessions (memory_gb=${MEMORY_GB} threads=${THREADS})"
+singularity exec "$KMAT_IMG" kmat --profile hpc --threads "${THREADS}" \
   build -k "$(pwd)/kset_list.txt" -s "$K" -o "$(pwd)/panel.kmat" \
   --memory-gb "${MEMORY_GB}" --tmpdir "${TMPDIR}"
 

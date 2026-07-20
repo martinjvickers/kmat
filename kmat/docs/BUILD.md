@@ -34,15 +34,29 @@ kmat --profile hpc --threads 16 build \
 | Flag | Meaning |
 |---|---|
 | `--memory-gb` | Working-set budget (GiB). Drives partition count. `0` → profile default (laptop **8**, hpc **64**). |
-| `--batch-rows` | Rows per shard I/O flush (default **100000**, same quantum as legacy fill). |
-| `--tmpdir` | Spill directory for partition shards (deleted after success). |
+| `--batch-rows` | Requested rows per shard I/O flush (default **100000**). May be lowered automatically so \(P\) writer buffers fit in ~¼ of the budget. |
+| `--tmpdir` | Spill directory for partition / merge shards (deleted after success). |
 | `--threads` | Parallel shard pattern-dedup (and global runtime workers). |
 
 Slurm helper [hpc/run_build.slurm](../../hpc/run_build.slurm) sets `set -euo pipefail`, passes `--memory-gb` ≈ 90% of `--mem`, and uses `$SLURM_TMPDIR` when present.
 
+## Scalability model (N=10³–10⁴, large genomes)
+
+| Resource | Bound | Behaviour |
+|---|---|---|
+| Open files during merge | `RLIMIT_NOFILE` (soft raised to hard at start) | If \(N\) ≤ budget → one multiway merge. If \(N\) > budget → **hierarchical** group merge into sorted row spills, then reduce. |
+| Partition count \(P\) | Memory + absolute cap **65536** | Sized so expected rows/shard fit in `memory/threads`. \(\sum K_i\) is only an **upper bound** on unique \(U\) (makes \(P\) larger / safer). **Not** capped at 128. |
+| Shard FDs while writing | 1 at a time | Writers **open-append-close** on flush — large \(P\) does not mean large concurrent FDs. |
+| Map assemble | FD budget | Pattern shards concatenated one-at-a-time; map shards multiway-merged in **waves** if \(P\) is large. |
+| Pattern ids | `uint32` | Build fails clearly if a shard or the total exceeds \(2^{32}-1\). |
+
+Do **not** treat teff (N≈440) as the design point: wheat-scale panels need hierarchical merge and memory-driven \(P\), not hard FD×partition coupling.
+
+Debug / tests: `KMAT_BUILD_MAX_OPEN=<n>` forces a tiny merge FD budget (exercises hierarchical path).
+
 ## Memory model
 
-`--memory-gb` budgets **one shard worker’s** pattern table + row buffers (roughly `memory / threads` per parallel worker). Partition count \(P\) is chosen from \(\sum K_i\) (upper bound on unique \(U\)) so each shard’s expected working set fits. Raising `--memory-gb` lowers \(P\) (fewer, larger shards). Lowering it raises \(P\) (more spill, less RAM).
+`--memory-gb` budgets per-shard pattern tables (~`memory/threads` each) and aggregate writer buffers (~¼ budget). Raising it lowers \(P\) (fewer, larger shards). Lowering it raises \(P\) (more spill, less RAM per shard).
 
 What it does **not** mean: keeping the full unique-kmer table or all accession lists resident.
 
@@ -52,7 +66,7 @@ What it does **not** mean: keeping the full unique-kmer table or all accession l
 |---|---|---|---|
 | Toy / medium fixtures | 8–32G | 4–8 | Fine for CI-sized `.kset` |
 | ~440 accession teff-scale | 64–256G | 8–16 | Start at 64G; raise if a shard still OOMs |
-| Wheat-like unique counts | 256–512G | 16–32 | More RAM → fewer partitions → less I/O |
+| 1k–10k accessions / wheat-like \(U\) | 256–512G+ | 16–32 | Prefer node-local `$SLURM_TMPDIR`; hierarchical merge if soft `nofile` stays ~1024 |
 
 Do **not** set `--threads` near 64 unless `--mem` is large: more threads means more concurrent shard tables.
 
@@ -66,6 +80,9 @@ Do **not** set `--threads` near 64 unless `--mem` is large: more threads means m
 6. **Build must not hold \(\sum\) accession k-mer lists** or a monolithic `map<code, bitvector>` for production N.
 7. **Legacy win was bounded I/O batches (100k rows)** + external parallelism — port that idea; do not treat create-blank-then-fill as the only design.
 8. **Slurm scripts need `set -e`** so OOM/killed builds are not reported as success after a trailing `echo Done`.
+9. **File-descriptor limits matter, but do not hard-cap partitions for FDs.** Merge may keep one FD per live input stream; shard writers must not hold \(P\) FDs. When \(N\) exceeds the FD budget, merge hierarchically. A mistaken `P≤128` hard cap makes large-\(U\) shards OOM.
+10. **Keep `singularity exec … kmat … build` as one shell command.** Commenting out only the `singularity exec \` line leaves a bare `build` → `command not found`.
+11. **Never size \(P\) from \(\sum K_i\) while also opening \(P\) files.** \(\sum K_i\) as a \(U\) upper bound is fine for *memory* sizing only.
 
 ## Sequence-file build
 
