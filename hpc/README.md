@@ -20,8 +20,11 @@ Defaults: `$HOME/bin/kmat.img`, `paths.txt`, `-s 31 --ci 2`, `--cpus-per-task=8`
 KMC reads `.fq.gz` natively. The image builds a **patched KMC 3.2.4** (system zlib + `gzread`) — stock release/apt KMC often fails with “Some error while reading gzip file”.
 
 ```bash
-# from the repo root (so %files can find singularity/patches/)
+# anywhere — def is self-contained (clones kmat for patches)
 sudo singularity build ~/bin/kmat.img singularity/kmat.def
+# or after copying the def to $HOME as def.def:
+#   sudo singularity build ~/bin/kmat.img def.def
+
 singularity exec ~/bin/kmat.img which kmc          # /usr/local/bin/kmc
-singularity exec ~/bin/kmat.img ldd $(which kmc)   # should list libz.so
+singularity exec ~/bin/kmat.img ldd /usr/local/bin/kmc   # should list libz.so
 ```

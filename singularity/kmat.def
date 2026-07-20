@@ -1,12 +1,9 @@
 Bootstrap: docker
 From: ubuntu:22.04
 
-# Build from the repository root so %files resolves:
-#   sudo singularity build ~/bin/kmat.img singularity/kmat.def
-
-%files
-    singularity/patches/binary_reader.h /opt/kmat-patches/binary_reader.h
-    singularity/patches/apply-kmc-system-zlib.sh /opt/kmat-patches/apply-kmc-system-zlib.sh
+# Works from anywhere — no %files / local patch tree required:
+#   sudo singularity build ~/bin/kmat.img kmat.def
+# Patches are taken from the kmat git clone below.
 
 %post
     set -e
@@ -15,29 +12,38 @@ From: ubuntu:22.04
         build-essential ca-certificates cmake git pkg-config python3 wget zlib1g-dev
     rm -rf /var/lib/apt/lists/*
 
+    echo "cloning kmat (provides KMC patches + sources)"
+    git clone --depth 1 https://github.com/martinjvickers/kmat.git /opt/kmat-src
+
+    if [ -f /opt/kmat-src/CMakeLists.txt ]; then
+        SRC=/opt/kmat-src
+        PATCH_DIR=/opt/kmat-src/singularity/patches
+    else
+        SRC=/opt/kmat-src/kmat
+        PATCH_DIR=/opt/kmat-src/singularity/patches
+    fi
+
+    if [ ! -f "$PATCH_DIR/binary_reader.h" ] || [ ! -f "$PATCH_DIR/apply-kmc-system-zlib.sh" ]; then
+        echo "ERROR: KMC patches missing at $PATCH_DIR" >&2
+        ls -la /opt/kmat-src /opt/kmat-src/singularity 2>/dev/null || true
+        exit 1
+    fi
+
     # Build KMC from source with system zlib + gzFile reader patch.
-    # Stock release binaries (Cloudflare zlib + manual inflate) fail on many
-    # real Illumina/pigz .fq.gz with: "Some error while reading gzip file".
+    # Stock release binaries fail on many real .fq.gz with:
+    #   "Some error while reading gzip file"
     echo "building patched KMC 3.2.4 (system zlib + gzread)"
     cd /tmp
     git clone --depth 1 --branch v3.2.4 https://github.com/refresh-bio/KMC.git KMC
     cd KMC
-    cp -f /opt/kmat-patches/binary_reader.h kmc_core/binary_reader.h
-    python3 /opt/kmat-patches/apply-kmc-system-zlib.sh
+    cp -f "$PATCH_DIR/binary_reader.h" kmc_core/binary_reader.h
+    python3 "$PATCH_DIR/apply-kmc-system-zlib.sh"
 
     make -j"$(nproc)" kmc kmc_tools
     install -m 0755 bin/kmc bin/kmc_tools /usr/local/bin/
     /usr/local/bin/kmc 2>/dev/null || true
     ldd /usr/local/bin/kmc || true
     rm -rf /tmp/KMC
-
-    git clone --depth 1 https://github.com/martinjvickers/kmat.git /opt/kmat-src
-
-    if [ -f /opt/kmat-src/CMakeLists.txt ]; then
-        SRC=/opt/kmat-src
-    else
-        SRC=/opt/kmat-src/kmat
-    fi
 
     cmake -S "$SRC" -B /tmp/kmat-build \
         -DCMAKE_BUILD_TYPE=Release \
