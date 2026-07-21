@@ -31,12 +31,17 @@ if [ ! -f "$LIST" ]; then
 fi
 
 WORKDIR="${PWD}"
+FINAL_STRIPE="${WORKDIR}/stripes/${STRIPE}"
+STAGE_STRIPE="$FINAL_STRIPE"
+STAGED=0
+
+# Stage to node-local scratch only when it is a different path (avoids mv same-file noise).
 if [ -n "${SLURM_LOCAL_SCRATCH:-}" ]; then
-  cd "$SLURM_LOCAL_SCRATCH"
-  cp "${WORKDIR}/stripes/${STRIPE}" .
-  STAGE_STRIPE="$STRIPE"
-else
-  STAGE_STRIPE="${WORKDIR}/stripes/${STRIPE}"
+  STAGE_DIR="${SLURM_LOCAL_SCRATCH}/kmat_fill_${SLURM_JOB_ID:-$$}_${IDX}"
+  mkdir -p "$STAGE_DIR"
+  cp "$FINAL_STRIPE" "${STAGE_DIR}/${STRIPE}"
+  STAGE_STRIPE="${STAGE_DIR}/${STRIPE}"
+  STAGED=1
 fi
 
 n=0
@@ -48,7 +53,8 @@ while IFS= read -r KSET; do
   n=$((n + 1))
 done < "${WORKDIR}/${LIST}"
 
-if [ -n "${SLURM_LOCAL_SCRATCH:-}" ]; then
-  mv "$STAGE_STRIPE" "${WORKDIR}/stripes/${STRIPE}"
+if [ "$STAGED" -eq 1 ]; then
+  mv "$STAGE_STRIPE" "$FINAL_STRIPE"
+  rmdir "$(dirname "$STAGE_STRIPE")" 2>/dev/null || true
 fi
 echo "Done: stripes/${STRIPE} columns=$n"

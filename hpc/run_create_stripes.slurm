@@ -31,18 +31,29 @@ IDX="${SLURM_ARRAY_TASK_ID:-0}"
 OUT_NAME=$(printf "%s.%02d.bin" "$PREFIX" "$IDX")
 
 WORKDIR="${PWD}"
+mkdir -p "${WORKDIR}/stripes"
+STAGE_DIR="${WORKDIR}"
+UNIV_PATH="${WORKDIR}/${UNIV}"
+
 if [ -n "${SLURM_LOCAL_SCRATCH:-}" ]; then
-  cd "$SLURM_LOCAL_SCRATCH"
-  cp "${WORKDIR}/${UNIV}" .
+  STAGE_DIR="${SLURM_LOCAL_SCRATCH}/kmat_create_${SLURM_JOB_ID:-$$}_${IDX}"
+  mkdir -p "$STAGE_DIR"
+  cp "${WORKDIR}/${UNIV}" "${STAGE_DIR}/"
+  UNIV_PATH="${STAGE_DIR}/$(basename "$UNIV")"
 elif [ -n "${SLURM_TMPDIR:-}" ]; then
-  cd "$SLURM_TMPDIR"
-  cp "${WORKDIR}/${UNIV}" .
+  STAGE_DIR="${SLURM_TMPDIR}/kmat_create_${SLURM_JOB_ID:-$$}_${IDX}"
+  mkdir -p "$STAGE_DIR"
+  cp "${WORKDIR}/${UNIV}" "${STAGE_DIR}/"
+  UNIV_PATH="${STAGE_DIR}/$(basename "$UNIV")"
 fi
 
 singularity exec "$KMAT_IMG" kmat --profile hpc create-stripe \
-  -m "$(basename "$UNIV")" -s "$K" -o "$OUT_NAME" \
+  -m "$UNIV_PATH" -s "$K" -o "${STAGE_DIR}/${OUT_NAME}" \
   --num-accessions "$NACC" --stripe-index "$IDX" --batch-rows 100000
 
-mkdir -p "${WORKDIR}/stripes"
-mv "$OUT_NAME" "${WORKDIR}/stripes/"
+if [ "${STAGE_DIR}/${OUT_NAME}" != "${WORKDIR}/stripes/${OUT_NAME}" ]; then
+  mv "${STAGE_DIR}/${OUT_NAME}" "${WORKDIR}/stripes/${OUT_NAME}"
+  rm -f "${STAGE_DIR}/$(basename "$UNIV")" 2>/dev/null || true
+  rmdir "$STAGE_DIR" 2>/dev/null || true
+fi
 echo "Done: ${WORKDIR}/stripes/${OUT_NAME}"
