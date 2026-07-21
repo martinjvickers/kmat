@@ -2,12 +2,15 @@
 
 #include "kmat/log.hpp"
 #include "kmat/presence.hpp"
+#include "kmat/runtime.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
 #include <queue>
 #include <sstream>
 #include <unistd.h>
@@ -45,8 +48,55 @@ std::string scratch_root(const std::string& tmpdir) {
   return "/tmp";
 }
 
+class MergeProgress {
+ public:
+  explicit MergeProgress(std::string label) : label_(std::move(label)), t0_(Clock::now()) {}
+
+  void tick(std::uint64_t unique_emitted) {
+    const auto now = Clock::now();
+    if (now - last_ < std::chrono::seconds(15) && unique_emitted - last_unique_ < 5'000'000) {
+      return;
+    }
+    last_ = now;
+    last_unique_ = unique_emitted;
+    const auto sec = std::chrono::duration_cast<std::chrono::seconds>(now - t0_).count();
+    const double rate = sec > 0 ? static_cast<double>(unique_emitted) / static_cast<double>(sec) : 0.0;
+    std::ostringstream oss;
+    oss << label_ << ": unique=" << unique_emitted << " elapsed=" << sec << "s rate="
+        << static_cast<std::uint64_t>(rate) << "/s";
+    log_info(oss.str());
+  }
+
+  void done(std::uint64_t unique_emitted) {
+    const auto sec =
+        std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - t0_).count();
+    log_info(label_ + ": done unique=" + std::to_string(unique_emitted) + " elapsed=" +
+             std::to_string(sec) + "s");
+  }
+
+ private:
+  using Clock = std::chrono::steady_clock;
+  std::string label_;
+  Clock::time_point t0_;
+  Clock::time_point last_{t0_};
+  std::uint64_t last_unique_{0};
+};
+
+Error flush_code_buf(std::ofstream& out, std::vector<std::uint64_t>& buf) {
+  if (buf.empty()) {
+    return Error::success();
+  }
+  out.write(reinterpret_cast<const char*>(buf.data()),
+            static_cast<std::streamsize>(buf.size() * sizeof(std::uint64_t)));
+  if (!out) {
+    return Error::io_error("failed writing universe codes");
+  }
+  buf.clear();
+  return Error::success();
+}
+
 Error merge_sorted_code_streams(std::vector<PresenceSetCursor>& cursors, std::ofstream& out,
-                                std::uint64_t& unique_out) {
+                                std::uint64_t& unique_out, MergeProgress* progress) {
   unique_out = 0;
   std::priority_queue<HeapItem, std::vector<HeapItem>, HeapCmp> heap;
   for (std::size_t i = 0; i < cursors.size(); ++i) {
@@ -54,6 +104,8 @@ Error merge_sorted_code_streams(std::vector<PresenceSetCursor>& cursors, std::of
       heap.push(HeapItem{cursors[i].value(), i});
     }
   }
+  std::vector<std::uint64_t> buf;
+  buf.reserve(1u << 20);
   while (!heap.empty()) {
     const std::uint64_t code = heap.top().code;
     while (!heap.empty() && heap.top().code == code) {
@@ -66,17 +118,25 @@ Error merge_sorted_code_streams(std::vector<PresenceSetCursor>& cursors, std::of
         heap.push(HeapItem{cursors[item.src].value(), item.src});
       }
     }
-    out.write(reinterpret_cast<const char*>(&code), sizeof(code));
-    if (!out) {
-      return Error::io_error("failed writing universe codes");
-    }
+    buf.push_back(code);
     ++unique_out;
+    if (buf.size() >= (1u << 20)) {
+      if (auto err = flush_code_buf(out, buf); !err.ok()) {
+        return err;
+      }
+      if (progress) {
+        progress->tick(unique_out);
+      }
+    }
+  }
+  if (auto err = flush_code_buf(out, buf); !err.ok()) {
+    return err;
   }
   return Error::success();
 }
 
 Error merge_kset_group(const std::vector<std::string>& paths, std::size_t kmer_size,
-                       const fs::path& out_path) {
+                       const fs::path& out_path, const std::string& progress_label) {
   if (paths.empty()) {
     return Error::invalid_argument("empty kset group");
   }
@@ -97,19 +157,24 @@ Error merge_kset_group(const std::vector<std::string>& paths, std::size_t kmer_s
   header.magic[3] = 'I';
   header.version = 1;
   header.kmer_size = static_cast<std::uint32_t>(kmer_size);
-  header.num_kmers = 0;  // rewrite after count
+  header.num_kmers = 0;
 
-  std::ofstream out(out_path, std::ios::binary | std::ios::trunc);
+  std::ofstream out;
+  std::vector<char> streambuf(8u << 20);
+  out.rdbuf()->pubsetbuf(streambuf.data(), static_cast<std::streamsize>(streambuf.size()));
+  out.open(out_path, std::ios::binary | std::ios::trunc);
   if (!out) {
     return Error::io_error("failed to create universe: " + out_path.string());
   }
+
   out.write(reinterpret_cast<const char*>(&header), sizeof(header));
   if (!out) {
     return Error::io_error("failed writing universe header");
   }
 
+  MergeProgress progress(progress_label);
   std::uint64_t unique = 0;
-  if (auto err = merge_sorted_code_streams(cursors, out, unique); !err.ok()) {
+  if (auto err = merge_sorted_code_streams(cursors, out, unique, &progress); !err.ok()) {
     return err;
   }
   for (auto& c : cursors) {
@@ -122,14 +187,14 @@ Error merge_kset_group(const std::vector<std::string>& paths, std::size_t kmer_s
   if (!out) {
     return Error::io_error("failed rewriting universe header count");
   }
+  progress.done(unique);
   return Error::success();
 }
 
 Error merge_kuniv_group(const std::vector<fs::path>& paths, std::size_t kmer_size,
-                        const fs::path& out_path) {
+                        const fs::path& out_path, const std::string& progress_label) {
   struct UCursor {
     UniverseCursor cur;
-    bool open_ok{false};
   };
   std::vector<UCursor> cursors(paths.size());
   for (std::size_t i = 0; i < paths.size(); ++i) {
@@ -139,7 +204,6 @@ Error merge_kuniv_group(const std::vector<fs::path>& paths, std::size_t kmer_siz
     if (cursors[i].cur.header().kmer_size != kmer_size) {
       return Error::invalid_argument("k-mer size mismatch in universe spill");
     }
-    cursors[i].open_ok = true;
   }
 
   UniverseHeader header{};
@@ -150,7 +214,10 @@ Error merge_kuniv_group(const std::vector<fs::path>& paths, std::size_t kmer_siz
   header.version = 1;
   header.kmer_size = static_cast<std::uint32_t>(kmer_size);
 
-  std::ofstream out(out_path, std::ios::binary | std::ios::trunc);
+  std::ofstream out;
+  std::vector<char> streambuf(8u << 20);
+  out.rdbuf()->pubsetbuf(streambuf.data(), static_cast<std::streamsize>(streambuf.size()));
+  out.open(out_path, std::ios::binary | std::ios::trunc);
   if (!out) {
     return Error::io_error("failed to create universe reduce: " + out_path.string());
   }
@@ -162,6 +229,9 @@ Error merge_kuniv_group(const std::vector<fs::path>& paths, std::size_t kmer_siz
       heap.push(HeapItem{cursors[i].cur.value(), i});
     }
   }
+  MergeProgress progress(progress_label);
+  std::vector<std::uint64_t> buf;
+  buf.reserve(1u << 20);
   std::uint64_t unique = 0;
   while (!heap.empty()) {
     const std::uint64_t code = heap.top().code;
@@ -175,11 +245,17 @@ Error merge_kuniv_group(const std::vector<fs::path>& paths, std::size_t kmer_siz
         heap.push(HeapItem{cursors[item.src].cur.value(), item.src});
       }
     }
-    out.write(reinterpret_cast<const char*>(&code), sizeof(code));
-    if (!out) {
-      return Error::io_error("failed writing reduced universe");
-    }
+    buf.push_back(code);
     ++unique;
+    if (buf.size() >= (1u << 20)) {
+      if (auto err = flush_code_buf(out, buf); !err.ok()) {
+        return err;
+      }
+      progress.tick(unique);
+    }
+  }
+  if (auto err = flush_code_buf(out, buf); !err.ok()) {
+    return err;
   }
   for (auto& c : cursors) {
     c.cur.close();
@@ -187,6 +263,7 @@ Error merge_kuniv_group(const std::vector<fs::path>& paths, std::size_t kmer_siz
   header.num_kmers = unique;
   out.seekp(0);
   out.write(reinterpret_cast<const char*>(&header), sizeof(header));
+  progress.done(unique);
   return Error::success();
 }
 
@@ -302,6 +379,7 @@ Error build_universe_from_presence_sets(const std::vector<std::string>& kset_pat
     return Error::invalid_argument("k-mer size must be in 1..32");
   }
   const std::size_t G = std::max<std::size_t>(2, group_size);
+  const std::size_t threads = effective_threads(runtime_config());
 
   const fs::path work =
       fs::path(scratch_root(tmpdir)) / ("kmat_kuniv_" + std::to_string(::getpid()));
@@ -318,51 +396,88 @@ Error build_universe_from_presence_sets(const std::vector<std::string>& kset_pat
     }
   } cleaner{work};
 
+  const std::size_t num_groups = (kset_paths.size() + G - 1) / G;
   log_info("build-master: accessions=" + std::to_string(kset_paths.size()) +
-           " group_size=" + std::to_string(G));
+           " groups=" + std::to_string(num_groups) + " group_size=" + std::to_string(G) +
+           " threads=" + std::to_string(threads));
 
   const auto t0 = std::chrono::steady_clock::now();
-  std::vector<fs::path> level;
-  int seq = 0;
-  for (std::size_t begin = 0; begin < kset_paths.size(); begin += G) {
+  std::vector<fs::path> level(num_groups);
+  std::vector<Error> group_errs(num_groups, Error::success());
+  std::atomic<std::size_t> groups_done{0};
+  std::mutex log_mu;
+
+  // Independent group merges — this is where most wall-clock time is for large panels.
+  parallel_for(0, num_groups, threads, [&](std::size_t gi) {
+    const std::size_t begin = gi * G;
     const std::size_t end = std::min(kset_paths.size(), begin + G);
     std::vector<std::string> group(kset_paths.begin() + static_cast<std::ptrdiff_t>(begin),
                                    kset_paths.begin() + static_cast<std::ptrdiff_t>(end));
-    const fs::path out = work / ("m" + std::to_string(seq++) + ".kuniv");
-    if (auto err = merge_kset_group(group, kmer_size, out); !err.ok()) {
-      return err;
+    const fs::path out = work / ("m" + std::to_string(gi) + ".kuniv");
+    const std::string label = "build-master group " + std::to_string(gi + 1) + "/" +
+                              std::to_string(num_groups) + " (n=" + std::to_string(group.size()) +
+                              ")";
+    group_errs[gi] = merge_kset_group(group, kmer_size, out, label);
+    if (!group_errs[gi].ok()) {
+      return;
     }
-    level.push_back(out);
+    level[gi] = out;
+    const std::size_t done = groups_done.fetch_add(1) + 1;
     const auto elapsed =
         std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - t0)
             .count();
-    log_info("build-master: groups=" + std::to_string(level.size()) + "/" +
-             std::to_string((kset_paths.size() + G - 1) / G) + " elapsed=" +
-             std::to_string(elapsed) + "s");
+    std::lock_guard<std::mutex> lock(log_mu);
+    log_info("build-master: groups_done=" + std::to_string(done) + "/" +
+             std::to_string(num_groups) + " elapsed=" + std::to_string(elapsed) + "s");
+  });
+
+  for (const auto& err : group_errs) {
+    if (!err.ok()) {
+      return err;
+    }
   }
 
+  int seq = static_cast<int>(num_groups);
   while (level.size() > 1) {
-    std::vector<fs::path> next;
-    for (std::size_t begin = 0; begin < level.size(); begin += G) {
-      const std::size_t end = std::min(level.size(), begin + G);
+    const std::size_t n_in = level.size();
+    const std::size_t n_out = (n_in + G - 1) / G;
+    log_info("build-master: reduce level in=" + std::to_string(n_in) + " out=" +
+             std::to_string(n_out) + " threads=" + std::to_string(std::min(threads, n_out)));
+
+    std::vector<fs::path> next(n_out);
+    std::vector<Error> reduce_errs(n_out, Error::success());
+    const int seq_base = seq;
+    seq += static_cast<int>(n_out);
+
+    parallel_for(0, n_out, std::min(threads, n_out), [&](std::size_t ri) {
+      const std::size_t begin = ri * G;
+      const std::size_t end = std::min(n_in, begin + G);
       std::vector<fs::path> group(level.begin() + static_cast<std::ptrdiff_t>(begin),
                                   level.begin() + static_cast<std::ptrdiff_t>(end));
-      const fs::path out = work / ("r" + std::to_string(seq++) + ".kuniv");
-      if (auto err = merge_kuniv_group(group, kmer_size, out); !err.ok()) {
+      const fs::path out = work / ("r" + std::to_string(seq_base + static_cast<int>(ri)) + ".kuniv");
+      const std::string label = "build-master reduce " + std::to_string(ri + 1) + "/" +
+                                std::to_string(n_out);
+      reduce_errs[ri] = merge_kuniv_group(group, kmer_size, out, label);
+      if (!reduce_errs[ri].ok()) {
+        return;
+      }
+      next[ri] = out;
+      for (const auto& p : group) {
+        std::error_code ignore;
+        fs::remove(p, ignore);
+      }
+    });
+
+    for (const auto& err : reduce_errs) {
+      if (!err.ok()) {
         return err;
       }
-      for (const auto& p : group) {
-        fs::remove(p, ec);
-      }
-      next.push_back(out);
     }
     level.swap(next);
-    log_info("build-master: reduce level size=" + std::to_string(level.size()));
   }
 
   fs::copy_file(level.front(), output_path, fs::copy_options::overwrite_existing, ec);
   if (ec) {
-    // Fallback: rename if same filesystem
     fs::rename(level.front(), output_path, ec);
     if (ec) {
       return Error::io_error("failed to write universe output: " + output_path);
@@ -373,8 +488,11 @@ Error build_universe_from_presence_sets(const std::vector<std::string>& kset_pat
   if (auto err = read_universe_header(output_path, hdr); !err.ok()) {
     return err;
   }
-  log_info("build-master: done unique_kmers=" + std::to_string(hdr.num_kmers) + " path=" +
-           output_path);
+  const auto elapsed =
+      std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - t0)
+          .count();
+  log_info("build-master: done unique_kmers=" + std::to_string(hdr.num_kmers) + " elapsed=" +
+           std::to_string(elapsed) + "s path=" + output_path);
   return Error::success();
 }
 

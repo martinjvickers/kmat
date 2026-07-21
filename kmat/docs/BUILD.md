@@ -37,8 +37,9 @@ An earlier scatter/hash-shard design (`a{i}/p{t}.bin`) fixed single-node OOM but
 ## CLI
 
 ```bash
-# Master universe (sorted unique codes)
-kmat --profile hpc build-master -k kset_list.txt -s 31 -o panel.kuniv --tmpdir "$TMPDIR"
+# Master universe (sorted unique codes; parallel group merges)
+kmat --profile hpc --threads 32 build-master -k kset_list.txt -s 31 -o panel.kuniv \
+  --tmpdir "$TMPDIR" --group-size 32
 
 # Blank stripe (≤64 accessions in stripe list)
 kmat create-stripe -m panel.kuniv -k list_00.txt -s 31 -o panel.00.bin \
@@ -53,11 +54,13 @@ kmat compress -m matrix_list.txt -k unified_list.txt -s 31 -o panel.kmat --memor
 
 | Flag / stage | Meaning |
 |---|---|
+| `--threads` | **build-master**: parallel independent group merges (and reduce). Effective workers ≈ `min(threads, ceil(N/group_size))`. |
+| `--group-size` | Fan-in per merge node (default 32). Smaller → more parallel groups; larger → fewer temps / FDs. |
 | `--batch-rows` | Create/fill I/O window (default **100000**, legacy default). |
 | `--memory-gb` | Bounds **compress** pattern-dictionary working set (spill to a small number of large shards if needed). Does **not** invent N×T files. |
 | `--tmpdir` | Scratch for master tree-merge temps / in-process build. Prefer `$SLURM_TMPDIR`. |
 
-Progress heartbeats: every **30s** (`KMAT_BUILD_LOG_EVERY_SEC`).
+Progress: **build-master** logs every ~15s / 5M unique codes per group (`unique=… rate=…/s`), plus `groups_done=i/G`. Other stages: every **30s** (`KMAT_BUILD_LOG_EVERY_SEC`).
 
 ## HPC
 
