@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -187,8 +188,62 @@ TEST_CASE("build-master produces sorted unique codes", "[universe][build]") {
     REQUIRE(cur.advance().ok());
   }
   REQUIRE(codes.size() == cur.header().num_kmers);
+  REQUIRE(codes.size() > 0);
   REQUIRE(std::is_sorted(codes.begin(), codes.end()));
   REQUIRE(std::adjacent_find(codes.begin(), codes.end()) == codes.end());
+
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+}
+
+TEST_CASE("universe cursor recovers zero num_kmers header from file size", "[universe]") {
+  const fs::path dir = tmp_dir("kuniv_hdr");
+  const fs::path path = dir / "broken.kuniv";
+  kmat::UniverseHeader hdr{};
+  hdr.magic[0] = 'K';
+  hdr.magic[1] = 'U';
+  hdr.magic[2] = 'N';
+  hdr.magic[3] = 'I';
+  hdr.version = 1;
+  hdr.kmer_size = 3;
+  hdr.num_kmers = 0;  // simulate failed seekp rewrite
+  const std::vector<std::uint64_t> codes{1, 2, 5, 9};
+  {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
+    out.write(reinterpret_cast<const char*>(codes.data()),
+              static_cast<std::streamsize>(codes.size() * sizeof(std::uint64_t)));
+  }
+
+  kmat::UniverseCursor cur;
+  REQUIRE(cur.open(path.string()).ok());
+  REQUIRE(cur.header().num_kmers == codes.size());
+  std::vector<std::uint64_t> got;
+  while (cur.has_value()) {
+    got.push_back(cur.value());
+    REQUIRE(cur.advance().ok());
+  }
+  REQUIRE(got == codes);
+
+  // Tree-reduce must also see the recovered codes.
+  const fs::path out = dir / "merged.kuniv";
+  // Build via two broken inputs through build_universe would need ksets; merge path tested
+  // by re-writing a second broken file and opening both via a tiny build from ksets instead:
+  // header rewrite on fresh build-master must leave a non-zero count on disk.
+  auto kset_paths = make_ksets(dir, 3);
+  REQUIRE(kmat::build_universe_from_presence_sets(kset_paths, 3, out.string(), dir.string(), 2)
+              .ok());
+  kmat::UniverseHeader out_hdr{};
+  REQUIRE(kmat::read_universe_header(out.string(), out_hdr).ok());
+  REQUIRE(out_hdr.num_kmers > 0);
+  // On-disk header itself must be patched (not only recovered at read time).
+  {
+    std::ifstream in(out, std::ios::binary);
+    kmat::UniverseHeader raw{};
+    in.read(reinterpret_cast<char*>(&raw), sizeof(raw));
+    REQUIRE(raw.num_kmers == out_hdr.num_kmers);
+    REQUIRE(raw.num_kmers > 0);
+  }
 
   std::error_code ec;
   fs::remove_all(dir, ec);

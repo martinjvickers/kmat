@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <queue>
 #include <sstream>
@@ -95,6 +96,32 @@ Error flush_code_buf(std::ofstream& out, std::vector<std::uint64_t>& buf) {
   return Error::success();
 }
 
+/// Patch num_kmers after the payload is fully closed. In-place seekp on a large
+/// custom-buffered ofstream can leave num_kmers=0 on disk while the file body is huge.
+Error rewrite_universe_num_kmers(const fs::path& path, std::uint64_t num_kmers) {
+  std::fstream f(path, std::ios::binary | std::ios::in | std::ios::out);
+  if (!f) {
+    return Error::io_error("failed to reopen universe for header rewrite: " + path.string());
+  }
+  UniverseHeader header{};
+  f.read(reinterpret_cast<char*>(&header), sizeof(header));
+  if (!f) {
+    return Error::io_error("failed reading universe header for rewrite: " + path.string());
+  }
+  if (header.magic[0] != 'K' || header.magic[1] != 'U' || header.magic[2] != 'N' ||
+      header.magic[3] != 'I') {
+    return Error::invalid_argument("invalid universe magic during header rewrite");
+  }
+  header.num_kmers = num_kmers;
+  f.seekp(0);
+  f.write(reinterpret_cast<const char*>(&header), sizeof(header));
+  f.flush();
+  if (!f) {
+    return Error::io_error("failed rewriting universe num_kmers: " + path.string());
+  }
+  return Error::success();
+}
+
 Error merge_sorted_code_streams(std::vector<PresenceSetCursor>& cursors, std::ofstream& out,
                                 std::uint64_t& unique_out, MergeProgress* progress) {
   unique_out = 0;
@@ -157,12 +184,9 @@ Error merge_kset_group(const std::vector<std::string>& paths, std::size_t kmer_s
   header.magic[3] = 'I';
   header.version = 1;
   header.kmer_size = static_cast<std::uint32_t>(kmer_size);
-  header.num_kmers = 0;
+  header.num_kmers = 0;  // patched after close
 
-  std::ofstream out;
-  std::vector<char> streambuf(8u << 20);
-  out.rdbuf()->pubsetbuf(streambuf.data(), static_cast<std::streamsize>(streambuf.size()));
-  out.open(out_path, std::ios::binary | std::ios::trunc);
+  std::ofstream out(out_path, std::ios::binary | std::ios::trunc);
   if (!out) {
     return Error::io_error("failed to create universe: " + out_path.string());
   }
@@ -180,12 +204,10 @@ Error merge_kset_group(const std::vector<std::string>& paths, std::size_t kmer_s
   for (auto& c : cursors) {
     c.close();
   }
-
-  header.num_kmers = unique;
-  out.seekp(0);
-  out.write(reinterpret_cast<const char*>(&header), sizeof(header));
-  if (!out) {
-    return Error::io_error("failed rewriting universe header count");
+  out.flush();
+  out.close();
+  if (auto err = rewrite_universe_num_kmers(out_path, unique); !err.ok()) {
+    return err;
   }
   progress.done(unique);
   return Error::success();
@@ -214,10 +236,7 @@ Error merge_kuniv_group(const std::vector<fs::path>& paths, std::size_t kmer_siz
   header.version = 1;
   header.kmer_size = static_cast<std::uint32_t>(kmer_size);
 
-  std::ofstream out;
-  std::vector<char> streambuf(8u << 20);
-  out.rdbuf()->pubsetbuf(streambuf.data(), static_cast<std::streamsize>(streambuf.size()));
-  out.open(out_path, std::ios::binary | std::ios::trunc);
+  std::ofstream out(out_path, std::ios::binary | std::ios::trunc);
   if (!out) {
     return Error::io_error("failed to create universe reduce: " + out_path.string());
   }
@@ -260,14 +279,33 @@ Error merge_kuniv_group(const std::vector<fs::path>& paths, std::size_t kmer_siz
   for (auto& c : cursors) {
     c.cur.close();
   }
-  header.num_kmers = unique;
-  out.seekp(0);
-  out.write(reinterpret_cast<const char*>(&header), sizeof(header));
+  out.flush();
+  out.close();
+  if (auto err = rewrite_universe_num_kmers(out_path, unique); !err.ok()) {
+    return err;
+  }
   progress.done(unique);
   return Error::success();
 }
 
 }  // namespace
+
+Error payload_count_from_file(const std::string& path, std::uint64_t& count_out) {
+  std::ifstream in(path, std::ios::binary | std::ios::ate);
+  if (!in) {
+    return Error::io_error("failed to stat universe: " + path);
+  }
+  const auto sz = static_cast<std::uint64_t>(in.tellg());
+  if (sz < sizeof(UniverseHeader)) {
+    return Error::invalid_argument("universe file too small: " + path);
+  }
+  const std::uint64_t payload = sz - sizeof(UniverseHeader);
+  if (payload % sizeof(std::uint64_t) != 0) {
+    return Error::invalid_argument("universe payload size not a multiple of 8: " + path);
+  }
+  count_out = payload / sizeof(std::uint64_t);
+  return Error::success();
+}
 
 Error write_universe(const std::string& path, const UniverseSet& set) {
   if (set.header.num_kmers != set.kmers.size()) {
@@ -316,6 +354,18 @@ Error read_universe_header(const std::string& path, UniverseHeader& header) {
   if (header.version != 1) {
     return Error::invalid_argument("unsupported universe version");
   }
+  std::uint64_t payload = 0;
+  if (auto err = payload_count_from_file(path, payload); !err.ok()) {
+    return err;
+  }
+  if (header.num_kmers == 0 && payload > 0) {
+    log_warn("universe header num_kmers=0 but file has " + std::to_string(payload) +
+             " codes; recovering from file size (" + path + ")");
+    header.num_kmers = payload;
+  } else if (header.num_kmers != payload) {
+    return Error::invalid_argument("universe header count (" + std::to_string(header.num_kmers) +
+                                   ") != file payload (" + std::to_string(payload) + "): " + path);
+  }
   return Error::success();
 }
 
@@ -332,6 +382,21 @@ Error UniverseCursor::open(const std::string& path) {
   if (header_.magic[0] != 'K' || header_.magic[1] != 'U' || header_.magic[2] != 'N' ||
       header_.magic[3] != 'I') {
     return Error::invalid_argument("invalid universe magic");
+  }
+  if (header_.version != 1) {
+    return Error::invalid_argument("unsupported universe version");
+  }
+  std::uint64_t payload = 0;
+  if (auto err = payload_count_from_file(path, payload); !err.ok()) {
+    return err;
+  }
+  if (header_.num_kmers == 0 && payload > 0) {
+    log_warn("universe header num_kmers=0 but file has " + std::to_string(payload) +
+             " codes; recovering from file size (" + path + ")");
+    header_.num_kmers = payload;
+  } else if (header_.num_kmers != payload) {
+    return Error::invalid_argument("universe header count (" + std::to_string(header_.num_kmers) +
+                                   ") != file payload (" + std::to_string(payload) + "): " + path);
   }
   remaining_ = header_.num_kmers;
   return advance();
@@ -487,6 +552,11 @@ Error build_universe_from_presence_sets(const std::vector<std::string>& kset_pat
   UniverseHeader hdr{};
   if (auto err = read_universe_header(output_path, hdr); !err.ok()) {
     return err;
+  }
+  if (hdr.num_kmers == 0) {
+    return Error::invalid_argument(
+        "build-master produced an empty universe (0 unique k-mers); check that .kset inputs "
+        "are non-empty");
   }
   const auto elapsed =
       std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - t0)
