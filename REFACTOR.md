@@ -24,7 +24,8 @@ No code under [`kmer_search/`](kmer_search/) is required to change while this ro
 | **2 — Format v2 (patterns)** | **done** | Pattern store + k-mer map; GWAS-by-pattern; [`kmat/docs/FORMAT.md`](kmat/docs/FORMAT.md); 17 ctests green |
 | **3 — FASTQ count/filter** | **done** | `.kset` + build-from-kset; production count now **KMC CLI** (`--engine kmc`); builtin fallback for tests |
 | **4 — Performance** | **done** | laptop/hpc profiles; parallel GWAS; rolling encode; `kmat_bench` + [`kmat/docs/BENCH.md`](kmat/docs/BENCH.md) |
-| **4b — Memory-bounded build** | **done** | streaming `.kset` merge + hash shards under `--memory-gb`; [`kmat/docs/BUILD.md`](kmat/docs/BUILD.md) |
+| **4b — Memory-bounded build** | **superseded** | Scatter/hash-shard path fixed single-node OOM but **regressed** HPC scale (N×T tiny files, single-node only). Do not use for production. |
+| **4c — Multi-node few-file build** | **done** | master `.kuniv` → create/fill stripes (100k batches) → v2 compress; Slurm scripts; scatter path superseded |
 | **5 — UX / features** | pending | config, doctor, polish |
 
 Update this table when a phase’s “done when” criteria are met.
@@ -55,9 +56,11 @@ Update this table when a phase’s “done when” criteria are met.
 
 - Preserving every legacy makefile binary.
 - Keeping KMC, SeqAn, or R as required parts of the happy path.
-- Treating the current create-blank-then-fill-every-row workflow as sacred if a streaming / online-dedup design scales better.
+- Keeping dense stripe bins as the *final* long-term format (v2 pattern store is the product).
+- Using KMC random-access at fill time once sorted `.kset` exists.
 - Inventing an unbounded scientific wishlist here—new ideas go in the **Feature backlog**.
 
+**Not a non-goal:** the legacy **create → fill orchestration** (few large stripe files, ≤64 columns per file, 100k-row batch I/O, Slurm array over stripes, local SSD staging). That job shape is required for multi-node / multi-TB panels. Only the on-disk *payload* (`.kset` / `.kuniv` instead of KMC; then compress to v2) may change.
 ### Design freedom
 
 The existing [`kmer_search/`](kmer_search/) code and [`matrix_presetup/`](matrix_presetup/) scripts are a **working prototype**, not the optimal architecture. Scale drivers below dictate the target design. Intermediate formats, job shapes, and dependencies may change whenever that reduces disk, CPU, or operational pain—while preserving the scientific pipeline (kmers → PA matrix → population structure → GWAS → gene follow-up).
@@ -83,10 +86,17 @@ The existing [`kmer_search/`](kmer_search/) code and [`matrix_presetup/`](matrix
 
 **Better approaches we will prefer when they win on scale:**
 
-- Assign **pattern IDs during ingest/fill** (online dedup) instead of only “write a full dense matrix then compress later.”
-- Prefer **streaming build/convert** over “allocate a blank multi-TB file and poke bits” once the FASTQ-native path exists.
+- Assign **pattern IDs during compress** (global online dedup) after dense stripe fill — not N×hash tiny spill files during merge.
+- Prefer **few large sequential files** (1 `.kuniv` + O(N/64) stripes + 1 v2) over inode storms.
+- **Scale out columns** with Slurm arrays over stripes; **scale out master** with tree-merge arrays over `.kset` groups.
 - Keep a **migration path** from legacy stripe panels so existing data is not stranded.
 
+**Anti-patterns (do not regress):**
+
+- Per-accession × hash-partition **tiny spill files** (N·T inodes).
+- Single-node-only build for production panels.
+- Holding U×N (or ΣK_i) in RAM.
+- Permanent duplicate patterns across shards (GWAS must score unique patterns once).
 ---
 
 ## How we organise ourselves
@@ -284,9 +294,11 @@ The multi-TB wheat panel is for design spikes and production benches, not CI. Th
 3. **Sequential I/O** — design for NFS; avoid per-k-mer random seeks on network filesystems.
 4. **Separate I/O-bound from CPU-bound** — fill/search vs GWAS/PCA so HPC arrays stay efficient.
 5. **Measure** — no optimisation without a bench on a named dataset.
-6. **Scale out columns** — chunk parallelism for thousands of accessions; do not require one giant RAM-resident matrix.
+6. **Scale out columns** — stripe / chunk parallelism for thousands of accessions; do not require one giant RAM-resident matrix.
 7. **Stream by default** — sampling and converts must not assume the full matrix fits in memory.
-
+8. **Few large files** — durable build artifacts ≈ `1 kuniv + ceil(N/64) stripes (+ 1 v2)`; never hundreds of thousands of tiny spills.
+9. **Bounded batches** — create/fill use ~100k-row I/O windows (legacy hard-won default).
+10. **Local SSD for rewrite traffic** — stage stripe create/fill on node scratch; copy back to shared storage.
 ---
 
 ## Feature backlog
@@ -311,7 +323,9 @@ Status values: `idea` | `planned` | `in-phase-N` | `done`.
 | F14 | In-house FASTQ/FASTA parsers (zlib) | done | Phase 1 gzip; Phase 3 count/filter |
 | F15 | *(your features here)* | idea | Add rows as you define them |
 | F16 | Medium panel k=31, N>64, `.fastq.gz`, GitHub-sized | done | `testdata/panel_k31_n72/` (~300 KB) |
-
+| F17 | Multi-node few-file build (master/create/fill/compress) | done | Phase 4c |
+| F18 | Global pattern coalesce at compress (no cross-shard dups) | done | Phase 4c |
+| F19 | Retire N×T scatter spill layout from production | done | Staged path is default; scatter code quarantined |
 ---
 
 ## Open questions
@@ -334,6 +348,7 @@ Status values: `idea` | `planned` | `in-phase-N` | `done`.
 4. ~~**Phase 2:** freeze `docs/FORMAT.md` v2; build writes pattern-compressed matrices; GWAS scores unique patterns once; gene uses k-mer→pattern map~~ **done**
 5. ~~**Phase 3:** FASTQ-native count/filter ingest (`-ci`-style); optional KMC import for migration only~~ **done**
 6. ~~**Phase 4:** performance / HPC + laptop profiles; benches~~ **done**
-7. **Phase 5 (next):** UX polish (config, doctor, help).
+7. **Phase 4c:** multi-node few-file build — master `.kuniv` → stripe create/fill → v2 compress (**done**).
+8. **Phase 5:** UX polish (config, doctor, help).
 
 When the **live product’s scientific behaviour** changes, update [`ARCHITECTURE.md`](ARCHITECTURE.md) (or a successor “kmat behaviour” doc). When plans, phases, or backlog change, update **this** file.

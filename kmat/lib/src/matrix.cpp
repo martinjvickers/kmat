@@ -1,12 +1,11 @@
 #include "kmat/matrix.hpp"
 
-#include "kmat/build_stream.hpp"
 #include "kmat/fastq.hpp"
 #include "kmat/log.hpp"
 #include "kmat/presence.hpp"
 #include "kmat/runtime.hpp"
 #include "kmat/sequence.hpp"
-
+#include "kmat/stripe_build.hpp"
 #include <algorithm>
 #include <map>
 #include <unordered_map>
@@ -383,8 +382,8 @@ Error build_matrix_from_presence_sets(const BuildOptions& opts) {
   if (auto err = validate_build_options(opts); !err.ok()) {
     return err;
   }
-  // Production path: stream sorted .ksets under --memory-gb (never load all vectors).
-  return build_matrix_from_presence_sets_streaming(opts);
+  // Production path: master → stripe create/fill → v2 compress (few large files).
+  return build_matrix_from_presence_sets_staged(opts);
 }
 
 Error build_matrix_from_accessions(const BuildOptions& opts) {

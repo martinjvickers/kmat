@@ -62,7 +62,7 @@ On wheat-scale data, many k-mers share the same PA vector (~2/3 duplicates obser
 
 ### Build
 
-`kmat build` writes **v2** by default. Production path: stream-merge sorted `.kset` files under `--memory-gb` (see [BUILD.md](BUILD.md)). Sequence FASTA/FASTQ/`.gz` inputs remain for small tests only.
+`kmat build` / `compress` write **v2** by default. Production path: master `.kuniv` → dense stripe create/fill → **global** pattern compress (see [BUILD.md](BUILD.md)). Sequence FASTA/FASTQ/`.gz` inputs remain for small tests only.
 
 ### Codec choice (locked for v2)
 
@@ -84,9 +84,40 @@ Per-accession filtered k-mer presence set produced by `kmat count` (or `kmat imp
 | 20 | `uint64` | `num_kmers` |
 | 28 | `uint64[num_kmers]` | Sorted unique k-mer codes |
 
-`kmat build` detects `.kset` paths in the accession list and unions them into a v2 matrix (same list order as GWAS columns). Do not mix `.kset` and sequence paths in one list.
+`kmat build` detects `.kset` paths in the accession list and builds via **master → stripe create/fill → v2 compress** (see [BUILD.md](BUILD.md)). Do not mix `.kset` and sequence paths in one list.
 
 Production `.kset` files are usually produced by `kmat count --engine kmc` (KMC CLI → dump → encode). `--engine builtin` is for small fixtures only.
+
+---
+
+## Master universe (`.kuniv`) — Phase 4c
+
+Sorted unique k-mer codes for the panel (row universe), produced by tree-merging `.kset` files. Little-endian.
+
+| Offset | Type | Field |
+|---|---|---|
+| 0 | `char[4]` | Magic `KUNI` |
+| 4 | `uint32` | `version` (= 1) |
+| 8 | `uint32` | `kmer_size` |
+| 12 | `uint32` | `reserved` |
+| 16 | `uint64` | `num_kmers` |
+| 24 | `uint64[num_kmers]` | Sorted unique k-mer codes |
+
+Dense stripe create streams this file (same role as legacy master KMC `final` listing).
+
+---
+
+## Dense stripe `.bin` (v1, one word) — Phase 4c intermediate
+
+Legacy-compatible single-stripe PA file (≤64 accessions in the stripe’s list). Header is a normal **v1** `KMAT` header with `num_stripes = 1` in the *file* (one presence word per row); `num_accessions` is the **global** panel size; `num_rows` matches `.kuniv`.
+
+After the header, `num_rows` records of 16 bytes:
+
+```text
+{ uint64 kmer_code; uint64 presence_word; }
+```
+
+Filled stripes are listed in `matrix_list.txt` and compressed to v2.
 
 ---
 

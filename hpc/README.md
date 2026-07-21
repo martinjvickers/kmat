@@ -1,10 +1,8 @@
 # Simple Slurm usage (no binds)
 
 Production `kmat count` uses **KMC** inside the Singularity image (`--engine kmc`).
-Copy these next to `paths.txt`:
 
-- `run_count.slurm` — array → `ksets/*.kset` (KMC, multithreaded)
-- `run_build.slurm` — union → `panel.kmat`
+## Small panels (single-node staged build)
 
 ```bash
 cd /path/to/testing_kmat
@@ -15,18 +13,38 @@ COUNT=$(sbatch --parsable --array=1-${N}%50 run_count.slurm)
 sbatch --dependency=afterok:${COUNT} run_build.slurm
 ```
 
-Defaults: `$HOME/bin/kmat.img`, `paths.txt`, `-s 31 --ci 2`, `--cpus-per-task=8` for KMC `-t`.
+`run_build.slurm` runs master → create/fill stripes → v2 compress in one job (few large files under `$SLURM_TMPDIR`).
 
-**Build** (`run_build.slurm`) is one job: streams `.kset` → `panel.kmat` with `--memory-gb` ≈ 90% of Slurm `--mem` (override with `MEMORY_GB=`). Details: [`kmat/docs/BUILD.md`](../kmat/docs/BUILD.md).
+## Production panels (multi-node, few-file)
 
-KMC reads `.fq.gz` natively. The image builds a **patched KMC 3.2.4** (system zlib + `gzread`) — stock release/apt KMC often fails with “Some error while reading gzip file”.
+Same shape as Watkins `matrix_presetup/`:
 
 ```bash
-# anywhere — def is self-contained (clones kmat for patches)
-sudo singularity build ~/bin/kmat.img singularity/kmat.def
-# or after copying the def to $HOME as def.def:
-#   sudo singularity build ~/bin/kmat.img def.def
+COUNT=$(sbatch --parsable --array=1-${N}%50 run_count.slurm)
+MASTER=$(sbatch --parsable --dependency=afterok:${COUNT} run_build_master.slurm)
+# Set --array=0-$((STRIPES-1)) and NACC=<accession count>
+CREATE=$(sbatch --parsable --dependency=afterok:${MASTER} --array=0-$((STRIPES-1)) \
+  --export=ALL,NACC=${NACC} run_create_stripes.slurm)
+FILL=$(sbatch --parsable --dependency=afterok:${CREATE} --array=0-$((STRIPES-1)) run_fill.slurm)
+sbatch --dependency=afterok:${FILL} run_compress.slurm
+```
 
-singularity exec ~/bin/kmat.img which kmc          # /usr/local/bin/kmc
-singularity exec ~/bin/kmat.img ldd /usr/local/bin/kmc   # should list libz.so
+| Script | Role |
+|---|---|
+| `run_count.slurm` | Array → `ksets/*.kset` |
+| `run_build_master.slurm` | Tree-merge → `panel.kuniv` |
+| `run_create_stripes.slurm` | Array → blank `stripes/panel.XX.bin` (SSD stage when available) |
+| `run_fill.slurm` | Array → fill columns from `.kset` (100k-row batches) |
+| `run_compress.slurm` | Stripes → `panel.kmat` (v2, global pattern dedup) |
+| `run_build.slurm` | Small-panel all-in-one staged build |
+
+Details: [`kmat/docs/BUILD.md`](../kmat/docs/BUILD.md).
+
+Defaults: `$HOME/bin/kmat.img`, `paths.txt`, `-s 31 --ci 2`.
+
+KMC reads `.fq.gz` natively. The image builds a **patched KMC 3.2.4** (system zlib + `gzread`).
+
+```bash
+sudo singularity build ~/bin/kmat.img singularity/kmat.def
+singularity exec ~/bin/kmat.img which kmc
 ```

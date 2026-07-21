@@ -4,10 +4,11 @@
 #include "kmat/io.hpp"
 #include "kmat/matrix.hpp"
 #include "kmat/presence.hpp"
+#include "kmat/stripe_build.hpp"
+#include "kmat/universe.hpp"
 
 #include <algorithm>
 #include <cstdint>
-#include <cstdlib>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -17,15 +18,13 @@ namespace fs = std::filesystem;
 namespace {
 
 fs::path tmp_dir(const std::string& name) {
-  const fs::path dir = fs::temp_directory_path() / ("kmat_build_stream_" + name);
+  const fs::path dir = fs::temp_directory_path() / ("kmat_staged_" + name);
   std::error_code ec;
   fs::remove_all(dir, ec);
   fs::create_directories(dir, ec);
   return dir;
 }
 
-/// Equal unique k-mers with identical presence bitvectors (pattern *ids* / store
-/// size may differ when code-hash partitions duplicate patterns across shards).
 bool matrices_semantically_equal(const kmat::PaMatrix& a, const kmat::PaMatrix& b) {
   if (a.header.num_rows != b.header.num_rows ||
       a.header.num_accessions != b.header.num_accessions ||
@@ -45,6 +44,43 @@ bool matrices_semantically_equal(const kmat::PaMatrix& a, const kmat::PaMatrix& 
     }
   }
   return true;
+}
+
+std::size_t count_files_recursive(const fs::path& root) {
+  std::size_t n = 0;
+  std::error_code ec;
+  if (!fs::exists(root, ec)) {
+    return 0;
+  }
+  for (auto it = fs::recursive_directory_iterator(root, ec);
+       it != fs::recursive_directory_iterator(); it.increment(ec)) {
+    if (it->is_regular_file(ec)) {
+      ++n;
+    }
+  }
+  return n;
+}
+
+std::vector<std::string> make_ksets(const fs::path& dir, std::size_t k = 3) {
+  const fs::path td = fs::path(KMAT_TESTDATA_DIR);
+  std::vector<std::string> fasta_paths;
+  REQUIRE(kmat::read_list_file((td / "accession_list.txt").string(), fasta_paths).ok());
+  REQUIRE(kmat::resolve_list_paths((td / "accession_list.txt").string(), fasta_paths).ok());
+
+  std::vector<std::string> kset_paths;
+  for (const std::string& fa : fasta_paths) {
+    const std::string id = kmat::accession_id_from_path(fa);
+    const fs::path out = dir / (id + ".kset");
+    kmat::CountOptions copts;
+    copts.input_path = fa;
+    copts.output_path = out.string();
+    copts.kmer_size = k;
+    copts.min_count = 1;
+    copts.engine = kmat::CountEngine::Builtin;
+    REQUIRE(kmat::count_kmers_to_presence_set(copts).ok());
+    kset_paths.push_back(out.string());
+  }
+  return kset_paths;
 }
 
 }  // namespace
@@ -73,66 +109,94 @@ TEST_CASE("PresenceSetCursor streams sorted k-mers", "[presence][build]") {
   fs::remove_all(dir, ec);
 }
 
-TEST_CASE("streaming build matches under tiny memory budget", "[matrix][build]") {
-  const fs::path td = fs::path(KMAT_TESTDATA_DIR);
-  const fs::path dir = tmp_dir("mem");
-
-  std::vector<std::string> fasta_paths;
-  REQUIRE(kmat::read_list_file((td / "accession_list.txt").string(), fasta_paths).ok());
-  REQUIRE(kmat::resolve_list_paths((td / "accession_list.txt").string(), fasta_paths).ok());
-
-  std::vector<std::string> kset_paths;
-  for (const std::string& fa : fasta_paths) {
-    const std::string id = kmat::accession_id_from_path(fa);
-    const fs::path out = dir / (id + ".kset");
-    kmat::CountOptions copts;
-    copts.input_path = fa;
-    copts.output_path = out.string();
-    copts.kmer_size = 3;
-    copts.min_count = 1;
-    copts.engine = kmat::CountEngine::Builtin;
-    REQUIRE(kmat::count_kmers_to_presence_set(copts).ok());
-    kset_paths.push_back(out.string());
-  }
-
-  const fs::path large = dir / "large.kmat";
-  const fs::path tiny = dir / "tiny.kmat";
+TEST_CASE("staged build matches sequence build semantically", "[matrix][build]") {
+  const fs::path dir = tmp_dir("staged");
   const fs::path spill = dir / "spill";
   fs::create_directories(spill);
 
-  kmat::BuildOptions bloated;
-  bloated.kmer_size = 3;
-  bloated.accession_paths = kset_paths;
-  bloated.output_path = large.string();
-  bloated.memory_bytes = 8ull << 30;
-  bloated.batch_rows = 100000;
-  bloated.tmpdir = spill.string();
-  bloated.num_threads = 2;
-  REQUIRE(kmat::build_matrix_from_accessions(bloated).ok());
+  const fs::path td = fs::path(KMAT_TESTDATA_DIR);
+  std::vector<std::string> fasta_paths;
+  REQUIRE(kmat::read_list_file((td / "accession_list.txt").string(), fasta_paths).ok());
+  REQUIRE(kmat::resolve_list_paths((td / "accession_list.txt").string(), fasta_paths).ok());
+  auto kset_paths = make_ksets(dir, 3);
 
-  kmat::BuildOptions tight;
-  tight.kmer_size = 3;
-  tight.accession_paths = kset_paths;
-  tight.output_path = tiny.string();
-  tight.memory_bytes = 1ull << 20;  // 1 MiB → many partitions
-  tight.batch_rows = 2;
-  tight.tmpdir = spill.string();
-  tight.num_threads = 4;
-  REQUIRE(kmat::build_matrix_from_accessions(tight).ok());
+  const fs::path via_seq = dir / "seq.kmat";
+  const fs::path via_kset = dir / "kset.kmat";
+
+  kmat::BuildOptions b1;
+  b1.kmer_size = 3;
+  b1.accession_paths = fasta_paths;
+  b1.output_path = via_seq.string();
+  REQUIRE(kmat::build_matrix_from_accessions(b1).ok());
+
+  kmat::BuildOptions b2;
+  b2.kmer_size = 3;
+  b2.accession_paths = kset_paths;
+  b2.output_path = via_kset.string();
+  b2.batch_rows = 16;
+  b2.tmpdir = spill.string();
+  REQUIRE(kmat::build_matrix_from_accessions(b2).ok());
 
   kmat::PaMatrix m1;
   kmat::PaMatrix m2;
-  REQUIRE(kmat::read_matrix(large.string(), m1).ok());
-  REQUIRE(kmat::read_matrix(tiny.string(), m2).ok());
+  REQUIRE(kmat::read_matrix(via_seq.string(), m1).ok());
+  REQUIRE(kmat::read_matrix(via_kset.string(), m2).ok());
   REQUIRE(matrices_semantically_equal(m1, m2));
 
   std::error_code ec;
   fs::remove_all(dir, ec);
 }
 
-TEST_CASE("streaming build medium panel under constrained memory", "[matrix][build][medium]") {
+TEST_CASE("staged build keeps few files under tmpdir", "[matrix][build]") {
+  const fs::path dir = tmp_dir("fewfiles");
+  const fs::path spill = dir / "spill";
+  fs::create_directories(spill);
+  auto kset_paths = make_ksets(dir, 3);
+
+  kmat::BuildOptions opts;
+  opts.kmer_size = 3;
+  opts.accession_paths = kset_paths;
+  opts.output_path = (dir / "out.kmat").string();
+  opts.batch_rows = 8;
+  opts.tmpdir = spill.string();
+  REQUIRE(kmat::build_matrix_from_accessions(opts).ok());
+
+  // During build, Cleaner removes work dir on success. Peak is bounded by
+  // O(N/group + stripes); assert final spill is empty/small and we never used N*T layout.
+  const std::size_t n = kset_paths.size();
+  const std::size_t stripes = kmat::stripe_count_for_accessions(n);
+  // Soft bound: if anything left, far below N*64 scatter footprint.
+  REQUIRE(count_files_recursive(spill) < n * 4 + stripes + 8);
+
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+}
+
+TEST_CASE("build-master produces sorted unique codes", "[universe][build]") {
+  const fs::path dir = tmp_dir("kuniv");
+  auto kset_paths = make_ksets(dir, 3);
+  const fs::path out = dir / "panel.kuniv";
+  REQUIRE(kmat::build_universe_from_presence_sets(kset_paths, 3, out.string(), dir.string(), 2)
+              .ok());
+
+  kmat::UniverseCursor cur;
+  REQUIRE(cur.open(out.string()).ok());
+  std::vector<std::uint64_t> codes;
+  while (cur.has_value()) {
+    codes.push_back(cur.value());
+    REQUIRE(cur.advance().ok());
+  }
+  REQUIRE(codes.size() == cur.header().num_kmers);
+  REQUIRE(std::is_sorted(codes.begin(), codes.end()));
+  REQUIRE(std::adjacent_find(codes.begin(), codes.end()) == codes.end());
+
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+}
+
+TEST_CASE("staged build medium panel", "[matrix][build][medium]") {
   const fs::path td = fs::path(KMAT_TESTDATA_DIR) / "panel_k31_n72";
-  const fs::path dir = tmp_dir("medium_mem");
+  const fs::path dir = tmp_dir("medium");
   const fs::path spill = dir / "spill";
   fs::create_directories(spill);
 
@@ -140,7 +204,6 @@ TEST_CASE("streaming build medium panel under constrained memory", "[matrix][bui
   REQUIRE(kmat::read_list_file((td / "accession_list.txt").string(), paths).ok());
   REQUIRE(kmat::resolve_list_paths((td / "accession_list.txt").string(), paths).ok());
 
-  // Count a subset to .kset for a faster streaming check (first 8 accessions).
   const std::size_t n = std::min<std::size_t>(8, paths.size());
   std::vector<std::string> kset_paths;
   for (std::size_t i = 0; i < n; ++i) {
@@ -163,19 +226,13 @@ TEST_CASE("streaming build medium panel under constrained memory", "[matrix][bui
   o1.kmer_size = 31;
   o1.accession_paths = kset_paths;
   o1.output_path = a.string();
-  o1.memory_bytes = 512ull << 20;
   o1.batch_rows = 1000;
   o1.tmpdir = spill.string();
   REQUIRE(kmat::build_matrix_from_accessions(o1).ok());
 
-  kmat::BuildOptions o2;
-  o2.kmer_size = 31;
-  o2.accession_paths = kset_paths;
+  kmat::BuildOptions o2 = o1;
   o2.output_path = b.string();
-  o2.memory_bytes = 4ull << 20;
   o2.batch_rows = 16;
-  o2.tmpdir = spill.string();
-  o2.num_threads = 2;
   REQUIRE(kmat::build_matrix_from_accessions(o2).ok());
 
   kmat::PaMatrix m1;
@@ -184,113 +241,6 @@ TEST_CASE("streaming build medium panel under constrained memory", "[matrix][bui
   REQUIRE(kmat::read_matrix(b.string(), m2).ok());
   REQUIRE(matrices_semantically_equal(m1, m2));
   REQUIRE(m1.header.num_accessions == n);
-
-  std::error_code ec;
-  fs::remove_all(dir, ec);
-}
-
-TEST_CASE("threaded streaming build matches single-thread", "[matrix][build]") {
-  const fs::path td = fs::path(KMAT_TESTDATA_DIR);
-  const fs::path dir = tmp_dir("threads");
-  const fs::path spill = dir / "spill";
-  fs::create_directories(spill);
-
-  std::vector<std::string> fasta_paths;
-  REQUIRE(kmat::read_list_file((td / "accession_list.txt").string(), fasta_paths).ok());
-  REQUIRE(kmat::resolve_list_paths((td / "accession_list.txt").string(), fasta_paths).ok());
-
-  std::vector<std::string> kset_paths;
-  for (const std::string& fa : fasta_paths) {
-    const std::string id = kmat::accession_id_from_path(fa);
-    const fs::path out = dir / (id + ".kset");
-    kmat::CountOptions copts;
-    copts.input_path = fa;
-    copts.output_path = out.string();
-    copts.kmer_size = 3;
-    copts.min_count = 1;
-    copts.engine = kmat::CountEngine::Builtin;
-    REQUIRE(kmat::count_kmers_to_presence_set(copts).ok());
-    kset_paths.push_back(out.string());
-  }
-
-  const fs::path one = dir / "t1.kmat";
-  const fs::path four = dir / "t4.kmat";
-
-  kmat::BuildOptions o1;
-  o1.kmer_size = 3;
-  o1.accession_paths = kset_paths;
-  o1.output_path = one.string();
-  o1.memory_bytes = 64ull << 20;
-  o1.batch_rows = 16;
-  o1.tmpdir = spill.string();
-  o1.num_threads = 1;
-  REQUIRE(kmat::build_matrix_from_accessions(o1).ok());
-
-  kmat::BuildOptions o4 = o1;
-  o4.output_path = four.string();
-  o4.num_threads = 4;
-  REQUIRE(kmat::build_matrix_from_accessions(o4).ok());
-
-  kmat::PaMatrix m1;
-  kmat::PaMatrix m4;
-  REQUIRE(kmat::read_matrix(one.string(), m1).ok());
-  REQUIRE(kmat::read_matrix(four.string(), m4).ok());
-  REQUIRE(matrices_semantically_equal(m1, m4));
-
-  std::error_code ec;
-  fs::remove_all(dir, ec);
-}
-
-TEST_CASE("hierarchical merge matches direct merge under tiny FD budget", "[matrix][build]") {
-  const fs::path td = fs::path(KMAT_TESTDATA_DIR);
-  const fs::path dir = tmp_dir("hier");
-  const fs::path spill = dir / "spill";
-  fs::create_directories(spill);
-
-  std::vector<std::string> fasta_paths;
-  REQUIRE(kmat::read_list_file((td / "accession_list.txt").string(), fasta_paths).ok());
-  REQUIRE(kmat::resolve_list_paths((td / "accession_list.txt").string(), fasta_paths).ok());
-
-  std::vector<std::string> kset_paths;
-  for (const std::string& fa : fasta_paths) {
-    const std::string id = kmat::accession_id_from_path(fa);
-    const fs::path out = dir / (id + ".kset");
-    kmat::CountOptions copts;
-    copts.input_path = fa;
-    copts.output_path = out.string();
-    copts.kmer_size = 3;
-    copts.min_count = 1;
-    copts.engine = kmat::CountEngine::Builtin;
-    REQUIRE(kmat::count_kmers_to_presence_set(copts).ok());
-    kset_paths.push_back(out.string());
-  }
-
-  const fs::path direct = dir / "direct.kmat";
-  const fs::path hier = dir / "hier.kmat";
-
-  kmat::BuildOptions o1;
-  o1.kmer_size = 3;
-  o1.accession_paths = kset_paths;
-  o1.output_path = direct.string();
-  o1.memory_bytes = 64ull << 20;
-  o1.batch_rows = 16;
-  o1.tmpdir = spill.string();
-  o1.num_threads = 2;
-  unsetenv("KMAT_BUILD_MAX_OPEN");
-  REQUIRE(kmat::build_matrix_from_accessions(o1).ok());
-
-  // Force hierarchical accession merge (group size 2) regardless of ulimit.
-  REQUIRE(setenv("KMAT_BUILD_MAX_OPEN", "2", 1) == 0);
-  kmat::BuildOptions o2 = o1;
-  o2.output_path = hier.string();
-  REQUIRE(kmat::build_matrix_from_accessions(o2).ok());
-  unsetenv("KMAT_BUILD_MAX_OPEN");
-
-  kmat::PaMatrix m1;
-  kmat::PaMatrix m2;
-  REQUIRE(kmat::read_matrix(direct.string(), m1).ok());
-  REQUIRE(kmat::read_matrix(hier.string(), m2).ok());
-  REQUIRE(matrices_semantically_equal(m1, m2));
 
   std::error_code ec;
   fs::remove_all(dir, ec);

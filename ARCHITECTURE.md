@@ -198,6 +198,20 @@ kmer_pa_matrix_new -m /path/to/final -k /path/to/list_XX.txt -n LOCAL_INDEX -o w
 
 After all stripes are filled, [`matrix_list.txt`](matrix_presetup/matrix_list.txt) points at the stripe bins in order for GWAS and gene search.
 
+### Scale constraints carried into kmat
+
+These production properties are **non-negotiable** for multi-TB / multi-node panels. kmat may replace KMC listing/RA with sorted `.kset` / `.kuniv`, and may compress dense stripes to v2, but must keep this job shape:
+
+| Constraint | Legacy practice | Required for kmat |
+|---|---|---|
+| File count | O(N/64) large stripe `.bin` files (+ 1 master) | Same order of magnitude; **never** N×hash tiny spills |
+| Parallelism | Slurm **array over stripes** (and batch unions for master) | Multi-node create/fill; tree-merge array for master |
+| Memory | Fill ≈ `100000 × record_bytes` I/O window | Bounded batches; no U×N in RAM |
+| Scratch | Local SSD stage, then `mv` to shared NFS | Prefer `$SLURM_TMPDIR` / localscratch for rewrite traffic |
+| Locks | `.lock.<word_index>` if concurrent fills hit one stripe | Preserve when overlapping writers |
+
+**Anti-patterns:** per-accession×partition inode storms; single-node-only build for production panels; permanent duplicate patterns across shards.
+
 ---
 
 ## PCA preparation before GWAS

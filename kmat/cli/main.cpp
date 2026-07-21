@@ -6,13 +6,16 @@
 #include "kmat/matrix.hpp"
 #include "kmat/pca.hpp"
 #include "kmat/runtime.hpp"
+#include "kmat/stripe_build.hpp"
+#include "kmat/universe.hpp"
 #include "kmat/validate.hpp"
 
 #include <CLI/CLI.hpp>
 
 #include <iostream>
 #include <string>
-
+#include <vector>
+#include <fstream>
 namespace {
 
 int fail(const kmat::Error& err) {
@@ -82,6 +85,82 @@ int run_build(const std::string& accession_list, std::size_t kmer_size, const st
   }
 
   kmat::log_info("wrote PA matrix: " + output);
+  return 0;
+}
+
+int run_build_master(const std::string& accession_list, std::size_t kmer_size,
+                     const std::string& output, const std::string& tmpdir, std::size_t group_size) {
+  std::vector<std::string> paths;
+  if (auto err = kmat::read_list_file(accession_list, paths); !err.ok()) {
+    return fail(err);
+  }
+  if (auto err = kmat::resolve_list_paths(accession_list, paths); !err.ok()) {
+    return fail(err);
+  }
+  if (auto err = kmat::build_universe_from_presence_sets(paths, kmer_size, output, tmpdir,
+                                                         group_size > 0 ? group_size : 32);
+      !err.ok()) {
+    return fail(err);
+  }
+  kmat::log_info("wrote universe: " + output);
+  return 0;
+}
+
+int run_create_stripe(const std::string& universe, const std::string& output, std::size_t kmer_size,
+                      std::size_t num_accessions, std::size_t stripe_index, std::size_t batch_rows) {
+  kmat::CreateStripeOptions opts;
+  opts.universe_path = universe;
+  opts.output_path = output;
+  opts.kmer_size = kmer_size;
+  opts.num_accessions = num_accessions;
+  opts.stripe_index = stripe_index;
+  opts.batch_rows = batch_rows;
+  if (auto err = kmat::create_blank_stripe(opts); !err.ok()) {
+    return fail(err);
+  }
+  kmat::log_info("wrote blank stripe: " + output);
+  return 0;
+}
+
+int run_fill(const std::string& stripe, const std::string& kset, std::size_t local_index,
+             std::size_t batch_rows) {
+  kmat::FillStripeOptions opts;
+  opts.stripe_path = stripe;
+  opts.kset_path = kset;
+  opts.local_index = local_index;
+  opts.batch_rows = batch_rows;
+  if (auto err = kmat::fill_stripe_column(opts); !err.ok()) {
+    return fail(err);
+  }
+  kmat::log_info("filled stripe column: " + stripe + " n=" + std::to_string(local_index));
+  return 0;
+}
+
+int run_compress(const std::string& matrix_list, const std::string& accession_list,
+                 std::size_t kmer_size, const std::string& output, double memory_gb,
+                 std::size_t batch_rows, const std::string& tmpdir) {
+  std::vector<std::string> stripes;
+  if (auto err = kmat::read_matrix_list(matrix_list, stripes); !err.ok()) {
+    return fail(err);
+  }
+  std::vector<std::string> accessions;
+  if (auto err = kmat::read_list_file(accession_list, accessions); !err.ok()) {
+    return fail(err);
+  }
+  kmat::CompressOptions opts;
+  opts.stripe_paths = std::move(stripes);
+  opts.num_accessions = accessions.size();
+  opts.kmer_size = kmer_size;
+  opts.output_path = output;
+  opts.batch_rows = batch_rows;
+  opts.tmpdir = tmpdir;
+  if (memory_gb > 0.0) {
+    opts.memory_bytes = static_cast<std::size_t>(memory_gb * (1024.0 * 1024.0 * 1024.0));
+  }
+  if (auto err = kmat::compress_stripes_to_v2(opts); !err.ok()) {
+    return fail(err);
+  }
+  kmat::log_info("wrote v2 matrix: " + output);
   return 0;
 }
 
@@ -176,11 +255,6 @@ int run_validate(const std::string& matrix_path, const std::string& matrix_list,
   return 1;
 }
 
-int run_not_implemented(const std::string& name) {
-  std::cerr << "kmat " << name << ": not implemented\n";
-  return 1;
-}
-
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -236,11 +310,69 @@ int main(int argc, char** argv) {
   build->add_option("--memory-gb", build_memory_gb,
                     "Working-set budget in GiB for streaming .kset build (0=profile default)");
   build->add_option("--batch-rows", build_batch_rows,
-                    "Rows per shard I/O flush (0=100000)");
-  build->add_option("--tmpdir", build_tmpdir, "Spill directory for build shards");
+                    "Rows per create/fill I/O batch (0=100000)");
+  build->add_option("--tmpdir", build_tmpdir, "Scratch directory for staged build");
 
-  CLI::App* fill = app.add_subcommand("fill", "Fill accession columns in a PA matrix");
-  (void)fill;
+  std::string master_list;
+  std::size_t master_k = 31;
+  std::string master_output;
+  std::string master_tmpdir;
+  std::size_t master_group = 32;
+  CLI::App* build_master =
+      app.add_subcommand("build-master", "Tree-merge .kset files into a .kuniv master universe");
+  build_master->add_option("-k,--accession-list", master_list, "List of .kset paths")->required();
+  build_master->add_option("-s,--kmer-size", master_k, "K-mer size")->required();
+  build_master->add_option("-o,--output", master_output, "Output .kuniv path")->required();
+  build_master->add_option("--tmpdir", master_tmpdir, "Scratch for merge temps");
+  build_master->add_option("--group-size", master_group, "Tree-merge fan-in")->default_val(32);
+
+  std::string create_universe;
+  std::string create_output;
+  std::size_t create_k = 31;
+  std::size_t create_nacc = 0;
+  std::size_t create_stripe = 0;
+  std::size_t create_batch = 0;
+  CLI::App* create_stripe_cmd =
+      app.add_subcommand("create-stripe", "Create a blank v1 dense stripe from .kuniv");
+  create_stripe_cmd->add_option("-m,--universe", create_universe, "Master .kuniv")->required();
+  create_stripe_cmd->add_option("-o,--output", create_output, "Output stripe .bin")->required();
+  create_stripe_cmd->add_option("-s,--kmer-size", create_k, "K-mer size")->required();
+  create_stripe_cmd->add_option("--num-accessions", create_nacc, "Global accession count")
+      ->required();
+  create_stripe_cmd->add_option("--stripe-index", create_stripe, "Stripe index (0-based)")
+      ->required();
+  create_stripe_cmd->add_option("--batch-rows", create_batch, "I/O batch (0=100000)");
+
+  std::string fill_stripe;
+  std::string fill_kset;
+  std::string fill_list;
+  std::size_t fill_n = 0;
+  std::size_t fill_batch = 0;
+  CLI::App* fill = app.add_subcommand("fill", "Fill one local column in a dense stripe from a .kset");
+  fill->add_option("-o,--output", fill_stripe, "Stripe .bin to update")->required();
+  fill->add_option("--kset", fill_kset, "Accession .kset path");
+  fill->add_option("-k,--accession-list", fill_list, "Stripe-local list (use with -n)");
+  fill->add_option("-n,--local-index", fill_n, "Local bit index within stripe (0..63)")->required();
+  fill->add_option("--batch-rows", fill_batch, "I/O batch (0=100000)");
+
+  std::string compress_matrix_list;
+  std::string compress_accession_list;
+  std::size_t compress_k = 31;
+  std::string compress_output;
+  double compress_memory_gb = 0.0;
+  std::size_t compress_batch = 0;
+  std::string compress_tmpdir;
+  CLI::App* compress =
+      app.add_subcommand("compress", "Compress filled v1 stripes into a v2 .kmat");
+  compress->add_option("-m,--matrix-list", compress_matrix_list, "List of filled stripe .bin paths")
+      ->required();
+  compress->add_option("-k,--accession-list", compress_accession_list, "Global accession list")
+      ->required();
+  compress->add_option("-s,--kmer-size", compress_k, "K-mer size")->required();
+  compress->add_option("-o,--output", compress_output, "Output v2 .kmat")->required();
+  compress->add_option("--memory-gb", compress_memory_gb, "Pattern-dict budget (0=profile default)");
+  compress->add_option("--batch-rows", compress_batch, "I/O batch (0=100000)");
+  compress->add_option("--tmpdir", compress_tmpdir, "Scratch directory");
 
   std::string pop_matrix;
   std::string pop_matrix_list;
@@ -336,6 +468,39 @@ int main(int argc, char** argv) {
     return run_build(build_accession_list, build_k, build_output, build_memory_gb, build_batch_rows,
                      build_tmpdir);
   }
+  if (name == "build-master") {
+    return run_build_master(master_list, master_k, master_output, master_tmpdir, master_group);
+  }
+  if (name == "create-stripe") {
+    return run_create_stripe(create_universe, create_output, create_k, create_nacc, create_stripe,
+                             create_batch);
+  }
+  if (name == "fill") {
+    std::string kset = fill_kset;
+    if (kset.empty()) {
+      if (fill_list.empty()) {
+        std::cerr << "error: provide --kset or -k accession-list with -n\n";
+        return 1;
+      }
+      std::vector<std::string> paths;
+      if (auto err = kmat::read_list_file(fill_list, paths); !err.ok()) {
+        return fail(err);
+      }
+      if (auto err = kmat::resolve_list_paths(fill_list, paths); !err.ok()) {
+        return fail(err);
+      }
+      if (fill_n >= paths.size()) {
+        std::cerr << "error: -n out of range for list\n";
+        return 1;
+      }
+      kset = paths[fill_n];
+    }
+    return run_fill(fill_stripe, kset, fill_n, fill_batch);
+  }
+  if (name == "compress") {
+    return run_compress(compress_matrix_list, compress_accession_list, compress_k, compress_output,
+                        compress_memory_gb, compress_batch, compress_tmpdir);
+  }
   if (name == "pop") {
     if (pop_matrix.empty() && pop_matrix_list.empty()) {
       std::cerr << "error: provide --matrix or --matrix-list\n";
@@ -365,9 +530,6 @@ int main(int argc, char** argv) {
       return 1;
     }
     return run_validate(validate_matrix, validate_matrix_list, validate_accession_list);
-  }
-  if (name == "fill") {
-    return run_not_implemented(name);
   }
 
   std::cerr << "kmat: unknown subcommand\n";

@@ -5,6 +5,10 @@
 #include "kmat/presence.hpp"
 #include "kmat/runtime.hpp"
 
+// NOTE (Phase 4c): This scatter/hash-shard path is SUPERSEDED for production.
+// Use stripe_build.hpp (master → create/fill → compress). Kept for reference only;
+// build_matrix_from_presence_sets() no longer calls into this file.
+
 #include <algorithm>
 #include <atomic>
 #include <cerrno>

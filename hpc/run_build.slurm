@@ -6,17 +6,14 @@
 #SBATCH --mem=64G
 #SBATCH --time=24:00:00
 #
-# Build panel.kmat from ksets/ produced by run_count.slurm.
-# Uses the same order as paths.txt.
+# Small-panel convenience: single-node staged build
+#   .kset list → master → create/fill stripes → v2 panel.kmat
+#
+# For production multi-node panels prefer:
+#   run_build_master.slurm → run_create_stripes.slurm → run_fill.slurm → run_compress.slurm
 #
 # Usage (after the count array finishes):
 #   sbatch --dependency=afterok:<COUNT_JOBID> run_build.slurm
-#
-# Memory: pass ~90% of the Slurm allocation as --memory-gb so the streaming
-# builder can size partition shards. Override with MEMORY_GB=... if needed.
-#
-# IMPORTANT: keep `singularity exec ... kmat ... build` as ONE command.
-# Do not comment out only the first line — a bare `build` is not a shell command.
 
 set -euo pipefail
 
@@ -25,13 +22,8 @@ LIST="${LIST:-paths.txt}"
 K=31
 THREADS="${SLURM_CPUS_PER_TASK:-16}"
 
-# Soft nofile is often 1024; kmat also raises soft→hard, and hierarchical-merges
-# if N still exceeds the budget. Raising here helps large panels (1000s of .kset).
-ulimit -n 65536 2>/dev/null || true
-
 mkdir -p logs
 
-# Prefer node-local scratch for partition spills when available.
 if [ -n "${SLURM_TMPDIR:-}" ]; then
   export TMPDIR="${SLURM_TMPDIR}"
 elif [ -d /tmp ]; then
@@ -39,11 +31,9 @@ elif [ -d /tmp ]; then
 fi
 mkdir -p "${TMPDIR}"
 
-# Derive --memory-gb from Slurm --mem (MiB) unless MEMORY_GB is set.
 if [ -z "${MEMORY_GB:-}" ]; then
   MEM_MB="${SLURM_MEM_PER_NODE:-0}"
   if [ "${MEM_MB}" -gt 0 ] 2>/dev/null; then
-    # 90% of allocation, at least 1 GiB
     MEMORY_GB=$(( MEM_MB * 90 / 100 / 1024 ))
     if [ "${MEMORY_GB}" -lt 1 ]; then
       MEMORY_GB=1
@@ -53,7 +43,6 @@ if [ -z "${MEMORY_GB:-}" ]; then
   fi
 fi
 
-# Build a kset list in the same order as paths.txt
 : > kset_list.txt
 missing=0
 while IFS= read -r FASTQ; do
@@ -77,9 +66,9 @@ if [ "$missing" -ne 0 ]; then
   exit 1
 fi
 
-echo "Building panel.kmat from $(wc -l < kset_list.txt) accessions (memory_gb=${MEMORY_GB} threads=${THREADS})"
+echo "Staged build panel.kmat from $(wc -l < kset_list.txt) accessions (memory_gb=${MEMORY_GB} threads=${THREADS})"
 singularity exec "$KMAT_IMG" kmat --profile hpc --threads "${THREADS}" \
   build -k "$(pwd)/kset_list.txt" -s "$K" -o "$(pwd)/panel.kmat" \
-  --memory-gb "${MEMORY_GB}" --tmpdir "${TMPDIR}"
+  --memory-gb "${MEMORY_GB}" --batch-rows 100000 --tmpdir "${TMPDIR}"
 
 echo "Done: $(pwd)/panel.kmat"
