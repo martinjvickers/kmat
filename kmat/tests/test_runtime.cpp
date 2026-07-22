@@ -73,9 +73,10 @@ TEST_CASE("parallel GWAS matches single-thread results", "[gwas][runtime]") {
   kmat::PcaOptions popts;
   popts.matrix_path = matrix_path.string();
   popts.accession_list_path = (td / "accession_list.txt").string();
-  popts.num_pcs = 2;
+  popts.num_pcs = 0;  // all PCs
   kmat::PcaResult pop;
   REQUIRE(kmat::run_pca(popts, pop).ok());
+  REQUIRE(pop.pcs.front().size() == paths.size());
   REQUIRE(kmat::write_pca_tsv(pop_path.string(), pop).ok());
 
   auto run = [&](std::size_t threads) {

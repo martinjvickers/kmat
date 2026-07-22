@@ -35,8 +35,8 @@ Error load_pop_table(const std::string& path, std::map<std::string, std::vector<
   }
   pop.clear();
   for (const TableRow& row : rows) {
-    if (row.values.size() < 2) {
-      return Error::invalid_argument("population structure file needs PC1 and PC2");
+    if (row.values.empty()) {
+      return Error::invalid_argument("population structure row has no PC columns: " + row.key);
     }
     pop[row.key] = row.values;
   }
@@ -102,15 +102,22 @@ Error run_gwas(const GwasOptions& opts, GwasResult& result) {
 
   const int N = static_cast<int>(pheno_to_accession.size());
   const int P = static_cast<int>(pheno_rows.front().values.size());
-  const int df = N - 4;
+  if (opts.num_pcs == 0) {
+    return Error::invalid_argument("gwas --npc must be >= 1");
+  }
+  const int npc = static_cast<int>(opts.num_pcs);
+  const int n_cov = 1 + npc;
+  const int df = N - n_cov;
   if (df <= 0) {
-    return Error::invalid_argument("not enough phenotyped accessions for GWAS (need N > 4)");
+    return Error::invalid_argument("not enough phenotyped accessions for GWAS (need N > " +
+                                   std::to_string(n_cov) + " for --npc " + std::to_string(npc) +
+                                   ")");
   }
 
   result.phenotype_names.assign(pheno_header.begin() + 1, pheno_header.end());
 
   Eigen::MatrixXd Y(N, P);
-  Eigen::MatrixXd C(N, 3);
+  Eigen::MatrixXd C(N, n_cov);
   std::vector<int> word_idx(static_cast<std::size_t>(N));
   std::vector<std::uint64_t> bit_mask(static_cast<std::size_t>(N));
 
@@ -126,9 +133,15 @@ Error run_gwas(const GwasOptions& opts, GwasResult& result) {
     if (pop_it == pop_map.end()) {
       return Error::invalid_argument("population structure missing accession: " + acc_id);
     }
+    if (pop_it->second.size() < opts.num_pcs) {
+      return Error::invalid_argument(
+          "population structure for " + acc_id + " has " + std::to_string(pop_it->second.size()) +
+          " PC columns but --npc=" + std::to_string(opts.num_pcs));
+    }
     C(r, 0) = 1.0;
-    C(r, 1) = pop_it->second[0];
-    C(r, 2) = pop_it->second[1];
+    for (int pc = 0; pc < npc; ++pc) {
+      C(r, 1 + pc) = pop_it->second[static_cast<std::size_t>(pc)];
+    }
 
     word_idx[static_cast<std::size_t>(r)] = acc_i >> 6;
     bit_mask[static_cast<std::size_t>(r)] = (1ULL << (acc_i & 63));
@@ -136,7 +149,7 @@ Error run_gwas(const GwasOptions& opts, GwasResult& result) {
 
   // Residualize phenotypes once (shared across all patterns / threads).
   Eigen::HouseholderQR<Eigen::MatrixXd> qr(C);
-  Eigen::MatrixXd Q = qr.householderQ() * Eigen::MatrixXd::Identity(N, 3);
+  Eigen::MatrixXd Q = qr.householderQ() * Eigen::MatrixXd::Identity(N, n_cov);
   Eigen::MatrixXd Y_res = Y - Q * (Q.transpose() * Y);
   Eigen::RowVectorXd Syy_res = Y_res.colwise().squaredNorm();
 
@@ -160,7 +173,7 @@ Error run_gwas(const GwasOptions& opts, GwasResult& result) {
     Eigen::VectorXd z_res(N);
     Eigen::VectorXd vec_eig(P);
     Eigen::RowVectorXd g(P);
-    Eigen::Vector3d z_proj;
+    Eigen::VectorXd z_proj(n_cov);
 
     int num_bits_set = 0;
     for (int r = 0; r < N; ++r) {

@@ -51,12 +51,12 @@ TEST_CASE("end-to-end build pop gwas gene on testdata", "[integration]") {
   kmat::PcaOptions pca_opts;
   pca_opts.matrix_path = matrix_path;
   pca_opts.accession_list_path = list_path;
-  pca_opts.num_pcs = 2;
+  pca_opts.num_pcs = 0;  // all PCs
   kmat::PcaResult pca_result;
   REQUIRE(kmat::run_pca(pca_opts, pca_result).ok());
   REQUIRE(pca_result.accessions.size() == 6);
   REQUIRE(pca_result.pcs.size() == 6);
-  REQUIRE(pca_result.pcs.front().size() == 2);
+  REQUIRE(pca_result.pcs.front().size() == 6);
   REQUIRE(kmat::write_pca_tsv(pop_path, pca_result).ok());
 
   kmat::GwasOptions gwas_opts;
@@ -65,10 +65,20 @@ TEST_CASE("end-to-end build pop gwas gene on testdata", "[integration]") {
   gwas_opts.phenotype_path = (td / "phenotypes.tsv").string();
   gwas_opts.pop_path = pop_path;
   gwas_opts.kmer_size = 3;
+  gwas_opts.num_pcs = 2;
   gwas_opts.print_all = true;
   kmat::GwasResult gwas_result;
   REQUIRE(kmat::run_gwas(gwas_opts, gwas_result).ok());
   REQUIRE(gwas_result.hits.size() > 0);
+
+  gwas_opts.num_pcs = 1;
+  kmat::GwasResult gwas_npc1;
+  REQUIRE(kmat::run_gwas(gwas_opts, gwas_npc1).ok());
+  REQUIRE(gwas_npc1.hits.size() > 0);
+
+  gwas_opts.num_pcs = 99;
+  kmat::GwasResult gwas_bad;
+  REQUIRE_FALSE(kmat::run_gwas(gwas_opts, gwas_bad).ok());
 
   std::ostringstream gwas_out;
   REQUIRE(kmat::write_gwas_tsv(gwas_out, 3, gwas_result, false).ok());

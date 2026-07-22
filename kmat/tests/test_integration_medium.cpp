@@ -72,10 +72,11 @@ TEST_CASE("end-to-end build pop gwas gene on k31 n72 FASTQ.gz panel", "[integrat
   kmat::PcaOptions pca_opts;
   pca_opts.matrix_path = matrix_path;
   pca_opts.accession_list_path = list_path;
-  pca_opts.num_pcs = 2;
+  pca_opts.num_pcs = 0;  // all PCs
   kmat::PcaResult pca_result;
   REQUIRE(kmat::run_pca(pca_opts, pca_result).ok());
   REQUIRE(pca_result.accessions.size() == 72);
+  REQUIRE(pca_result.pcs.front().size() == 72);
   REQUIRE(pca_result.accessions.front() == "acc_000");
   REQUIRE(kmat::write_pca_tsv(pop_path, pca_result).ok());
 
@@ -85,6 +86,7 @@ TEST_CASE("end-to-end build pop gwas gene on k31 n72 FASTQ.gz panel", "[integrat
   gwas_opts.phenotype_path = (td / "phenotypes.tsv").string();
   gwas_opts.pop_path = pop_path;
   gwas_opts.kmer_size = 31;
+  gwas_opts.num_pcs = 2;
   gwas_opts.print_all = true;
   kmat::GwasResult gwas_result;
   REQUIRE(kmat::run_gwas(gwas_opts, gwas_result).ok());

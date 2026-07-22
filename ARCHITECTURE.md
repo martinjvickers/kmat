@@ -164,7 +164,7 @@ TSV / tabular file (`-p` / `--phenotype-file` on the GWAS tool). Accession names
 
 ### Population structure
 
-PCA scores per accession (`-pop` / `--population-structure-file`). The GWAS tool uses an intercept plus the **first two** PC scores as covariates.
+PCA scores per accession (`-pop` / `--population-structure-file`). `kmat pop` writes all PCs by default; `kmat gwas --npc` (default 2) selects how many leading PCs to use with the intercept.
 
 ---
 
@@ -221,7 +221,7 @@ Evidence: [`05_random_kmers.slurm`](matrix_presetup/05_random_kmers.slurm), [`06
 1. Export / sample random k-mer PA patterns from the filled matrix (historical job used a legacy random-kmer binary against `unified_list.txt` + `matrix_list.txt`).
 2. Build a columns×accessions table (e.g. `random_kmers_cols.tsv`).
 3. R `princomp` on that matrix; bind PC loadings to [`modified_list.txt`](matrix_presetup/modified_list.txt); write a PCA TSV (e.g. `watkins4x_PCA_full.tsv`).
-4. GWAS consumes that file as `-pop` and uses **PC1 and PC2** (+ intercept) as covariates.
+4. GWAS consumes that file as `-pop` and uses the leading **`--npc`** PC columns (+ intercept) as covariates (default **PC1 and PC2**).
 
 ---
 
@@ -282,7 +282,7 @@ kmer_pa_matrix_new -m .../final -k .../list_00.txt -n 7 -o watkins_4x.00.bin
 **Behaviour**
 
 - Streams stripe files in blocks; reconstructs each k-mer’s full presence vector `z` across `unified_list` order.
-- Residualizes `z` and phenotypes against covariates `[1, PC1, PC2]` (Frisch–Waugh–Lovell / Householder QR).
+- Residualizes `z` and phenotypes against covariates `[1, PC1, …, PC_{npc}]` (Frisch–Waugh–Lovell / Householder QR; `npc` from `--npc`, default 2).
 - Fits OLS association per phenotype; two-sided Student’s t p-values with `df = N − 4` (intercept + 2 PCs + k-mer).
 - Emits top hits by minimum p-value across phenotypes (or all rows if `--print-all`).
 

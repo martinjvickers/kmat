@@ -16,6 +16,8 @@ struct GwasOptions {
   std::string phenotype_path;
   std::string pop_path;
   std::size_t kmer_size{31};
+  /// Number of leading PC columns from pop TSV to use as covariates (default 2).
+  std::size_t num_pcs{2};
   std::size_t top_n{1000};
   bool print_all{false};
   /// Fill `pa_bits` on hits (expensive); default off.

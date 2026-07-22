@@ -189,8 +189,8 @@ int run_pop(const std::string& matrix_path, const std::string& matrix_list,
 
 int run_gwas(const std::string& matrix_path, const std::string& matrix_list,
              const std::string& accession_list, const std::string& phenotype_path,
-             const std::string& pop_path, std::size_t kmer_size, std::size_t top_n, bool print_all,
-             bool display_pa) {
+             const std::string& pop_path, std::size_t kmer_size, std::size_t num_pcs,
+             std::size_t top_n, bool print_all, bool display_pa) {
   kmat::GwasOptions opts;
   opts.matrix_path = matrix_path;
   opts.matrix_list_path = matrix_list;
@@ -198,6 +198,7 @@ int run_gwas(const std::string& matrix_path, const std::string& matrix_list,
   opts.phenotype_path = phenotype_path;
   opts.pop_path = pop_path;
   opts.kmer_size = kmer_size;
+  opts.num_pcs = num_pcs;
   opts.top_n = top_n;
   opts.print_all = print_all;
   opts.include_pa_bits = display_pa;
@@ -378,7 +379,7 @@ int main(int argc, char** argv) {
   std::string pop_matrix_list;
   std::string pop_accession_list;
   std::string pop_output;
-  std::size_t pop_npc = 2;
+  std::size_t pop_npc = 0;
   std::size_t pop_max_samples = 0;
   unsigned pop_seed = 42;
   CLI::App* pop = app.add_subcommand("pop", "Compute population-structure covariates (PCA)");
@@ -386,8 +387,9 @@ int main(int argc, char** argv) {
   pop->add_option("-m,--matrix-list", pop_matrix_list, "PA stripe list (matrix_list.txt)");
   pop->add_option("-k,--accession-list", pop_accession_list, "Accession list")->required();
   pop->add_option("-o,--output", pop_output, "Output pop TSV")->required();
-  pop->add_option("--npc", pop_npc, "Number of PCs to emit")->default_val(2);
-  pop->add_option("--max-samples", pop_max_samples, "Max k-mer rows to sample (0=all)");
+  pop->add_option("--npc", pop_npc, "Number of PCs to emit (0=all)")->default_val(0);
+  pop->add_option("--max-samples", pop_max_samples,
+                  "Max patterns to sample for PCA (0=auto: all if ≤500k else 100k)");
   pop->add_option("--seed", pop_seed, "RNG seed for sampling");
 
   std::string gwas_matrix;
@@ -396,6 +398,7 @@ int main(int argc, char** argv) {
   std::string gwas_phenotype;
   std::string gwas_pop;
   std::size_t gwas_k = 31;
+  std::size_t gwas_npc = 2;
   std::size_t gwas_top_n = 1000;
   bool gwas_print_all = false;
   bool gwas_display = false;
@@ -406,6 +409,8 @@ int main(int argc, char** argv) {
   gwas->add_option("-p,--phenotype-file", gwas_phenotype, "Phenotype TSV")->required();
   gwas->add_option("--pop,--population-structure-file", gwas_pop, "Pop structure TSV")->required();
   gwas->add_option("-s,--kmer-size", gwas_k, "K-mer size")->required();
+  gwas->add_option("--npc", gwas_npc, "Number of leading PCs from pop TSV to use as covariates")
+      ->default_val(2);
   gwas->add_option("-N,--top-n", gwas_top_n, "Keep top N hits by min p-value")->default_val(1000);
   gwas->add_flag("-a,--print-all", gwas_print_all, "Score and print all k-mers");
   gwas->add_flag("-d,--display", gwas_display, "Include PA bitstring column");
@@ -515,7 +520,7 @@ int main(int argc, char** argv) {
       return 1;
     }
     return run_gwas(gwas_matrix, gwas_matrix_list, gwas_accession_list, gwas_phenotype, gwas_pop,
-                    gwas_k, gwas_top_n, gwas_print_all, gwas_display);
+                    gwas_k, gwas_npc, gwas_top_n, gwas_print_all, gwas_display);
   }
   if (name == "gene") {
     if (gene_matrix.empty() && gene_matrix_list.empty()) {

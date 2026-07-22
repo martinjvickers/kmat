@@ -57,6 +57,7 @@ mkdir -p "$OUT"
 ./build/cli/kmat pop -i "$OUT/panel.kmat" -k "$TD/accession_list.txt" -o "$OUT/pop.tsv"
 ./build/cli/kmat gwas -i "$OUT/panel.kmat" -k "$TD/accession_list.txt" \
   -p "$TD/phenotypes.tsv" --pop "$OUT/pop.tsv" -s 3 -a
+# pop writes all PCs by default; gwas uses PC1–PC2 unless --npc N
 ./build/cli/kmat gene -i "$OUT/panel.kmat" -k "$TD/accession_list.txt" \
   -g "$TD/gene.fasta" -s 3
 ```
@@ -88,7 +89,9 @@ mkdir -p "$OUT"
 
 ./build/cli/kmat --profile hpc build -k "$TD/accession_list.txt" -s 31 -o "$OUT/panel.kmat"
 ./build/cli/kmat validate -i "$OUT/panel.kmat" -k "$TD/accession_list.txt"
-./build/cli/kmat pop -i "$OUT/panel.kmat" -k "$TD/accession_list.txt" -o "$OUT/pop.tsv"
+./build/cli/kmat --profile hpc pop -i "$OUT/panel.kmat" -k "$TD/accession_list.txt" -o "$OUT/pop.tsv"
+# Production-scale panels (~1e8+ patterns): pop reservoir-samples 100k by default
+#   kmat --profile hpc pop -i panel.kmat -k kset_list.txt -o pop.tsv --max-samples 100000
 ./build/cli/kmat --profile hpc gwas -i "$OUT/panel.kmat" -k "$TD/accession_list.txt" \
   -p "$TD/phenotypes.tsv" --pop "$OUT/pop.tsv" -s 31 -a
 ```
@@ -100,8 +103,8 @@ mkdir -p "$OUT"
 | `count` | FASTQ/FASTA → `.kset` via **KMC** (`--engine kmc`) or builtin hashmap |
 | `import-kmers` | Text k-mer list → `.kset` (no KMC link) |
 | `build` | PA matrix from sequences or `.kset` (parallel ingest) |
-| `pop` | PCA population-structure TSV |
-| `gwas` | Pattern-parallel association |
+| `pop` | PCA population-structure TSV (all PCs by default; `--npc` caps) |
+| `gwas` | Pattern-parallel association (`--npc` covariates from pop TSV, default 2) |
 | `gene` | Gene FASTA k-mer lookup |
 | `validate` | Matrix/list consistency checks |
 | `fill` | Stub |

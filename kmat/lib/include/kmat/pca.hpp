@@ -13,8 +13,8 @@ struct PcaOptions {
   std::string matrix_path;
   std::string matrix_list_path;
   std::string accession_list_path;
-  std::size_t num_pcs{2};
-  std::size_t max_samples{0};  // 0 = all rows
+  std::size_t num_pcs{0};  // 0 = emit all PCs (min(n_acc, n_samples))
+  std::size_t max_samples{0};  // 0 = auto (all if small; else 100k)
   unsigned seed{42};
 };
 

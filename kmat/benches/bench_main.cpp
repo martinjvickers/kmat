@@ -149,7 +149,7 @@ int main(int argc, char** argv) {
     kmat::PcaOptions opts;
     opts.matrix_path = matrix_path.string();
     opts.accession_list_path = accession_list.string();
-    opts.num_pcs = 2;
+    opts.num_pcs = 0;  // all PCs
     const auto t0 = std::chrono::steady_clock::now();
     kmat::PcaResult result;
     if (auto err = kmat::run_pca(opts, result); !err.ok()) {
